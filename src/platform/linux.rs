@@ -554,6 +554,17 @@ fn try_start_server_(desktop: Option<&Desktop>) -> ResultType<Option<Child>> {
                 "TERM",
                 get_cur_term(&desktop.uid).unwrap_or_else(|| suggest_best_term()),
             ));
+            // PulseAudio: pass PULSE_SERVER so the --server subprocess can access
+            // the user's PulseAudio daemon. Without this, cpal falls back to raw
+            // ALSA which may lack capture devices (e.g. Jetson Tegra APE).
+            let pulse_socket = format!("/run/user/{}/pulse/native", desktop.uid);
+            if std::path::Path::new(&pulse_socket).exists() {
+                envs.push(("PULSE_SERVER", format!("unix:{}", pulse_socket)));
+            }
+            let pulse_cookie = format!("{}/.config/pulse/cookie", desktop.home);
+            if std::path::Path::new(&pulse_cookie).exists() {
+                envs.push(("PULSE_COOKIE", pulse_cookie));
+            }
             run_as_user(
                 vec!["--server"],
                 Some((desktop.uid.clone(), desktop.username.clone())),
