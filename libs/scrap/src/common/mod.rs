@@ -16,6 +16,8 @@ cfg_if! {
                 mod linux;
                 mod wayland;
                 mod x11;
+                #[cfg(target_os = "linux")]
+                mod drm;
                 pub use self::linux::*;
                 pub use self::wayland::set_map_err;
                 pub use self::x11::PixelBuffer;
