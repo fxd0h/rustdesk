@@ -52,6 +52,7 @@ bindgen = "0.65"
 pkg-config = { version = "0.3.27", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+libdrmtap-sys = "0.3.0"
 dbus = { version = "0.9", optional = true }
 tracing = { version = "0.1", optional = true }
 gstreamer = { version = "0.16", optional = true }

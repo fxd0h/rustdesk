@@ -19,66 +19,11 @@ use std::{io, time::{Duration, Instant}};
 use super::x11::PixelBuffer;
 
 // FFI bindings to libdrmtap — struct layouts must match drmtap.h exactly!
-mod ffi {
-    use std::os::raw::{c_char, c_int, c_void};
-
-    #[repr(C)]
-    pub struct drmtap_config {
-        pub device_path: *const c_char,
-        pub crtc_id: u32,
-        pub helper_path: *const c_char,
-        pub debug: c_int,
-    }
-
-    #[repr(C)]
-    #[derive(Clone)]
-    #[allow(non_camel_case_types)]
-    pub struct drmtap_display {
-        pub crtc_id: u32,
-        pub connector_id: u32,
-        pub name: [c_char; 32],
-        pub width: u32,
-        pub height: u32,
-        pub refresh_hz: u32,
-        pub active: c_int,
-    }
-
-    #[repr(C)]
-    #[allow(non_camel_case_types)]
-    pub struct drmtap_frame_info {
-        pub data: *mut c_void,
-        pub dma_buf_fd: c_int,
-        pub width: u32,
-        pub height: u32,
-        pub stride: u32,
-        pub format: u32,
-        pub modifier: u64,
-        pub fb_id: u32,
-        pub _priv: *mut c_void,
-    }
-
-    #[allow(non_camel_case_types)]
-    pub type drmtap_ctx = c_void;
-
-    #[link(name = "drmtap")]
-    extern "C" {
-        pub fn drmtap_open(cfg: *const drmtap_config) -> *mut drmtap_ctx;
-        pub fn drmtap_close(ctx: *mut drmtap_ctx);
-        pub fn drmtap_list_displays(
-            ctx: *mut drmtap_ctx,
-            displays: *mut drmtap_display,
-            max: c_int,
-        ) -> c_int;
-        pub fn drmtap_grab_mapped(
-            ctx: *mut drmtap_ctx,
-            frame: *mut drmtap_frame_info,
-        ) -> c_int;
-        pub fn drmtap_frame_release(
-            ctx: *mut drmtap_ctx,
-            frame: *mut drmtap_frame_info,
-        );
-    }
-}
+// Use libdrmtap-sys crate for static linking
+use libdrmtap_sys::{
+    drmtap_close, drmtap_config, drmtap_ctx, drmtap_display, drmtap_frame_info,
+    drmtap_grab_mapped, drmtap_frame_release, drmtap_list_displays, drmtap_open,
+};
 
 pub struct Display {
     name: String,
@@ -97,7 +42,7 @@ impl Display {
                 std::ffi::CString::new(s.as_str()).unwrap()
             });
 
-            let cfg = ffi::drmtap_config {
+            let cfg = drmtap_config {
                 device_path: device_cstr
                     .as_ref()
                     .map(|c| c.as_ptr())
@@ -106,7 +51,7 @@ impl Display {
                 helper_path: std::ptr::null(),
                 debug: if std::env::var("DRMTAP_DEBUG").is_ok() { 1 } else { 0 },
             };
-            let ctx = ffi::drmtap_open(&cfg);
+            let ctx = drmtap_open(&cfg);
             if ctx.is_null() {
                 return Err(io::Error::new(
                     io::ErrorKind::NotFound,
@@ -114,9 +59,9 @@ impl Display {
                 ));
             }
 
-            let mut raw_displays = vec![std::mem::zeroed::<ffi::drmtap_display>(); 8];
-            let n = ffi::drmtap_list_displays(ctx, raw_displays.as_mut_ptr(), 8);
-            ffi::drmtap_close(ctx);
+            let mut raw_displays = vec![std::mem::zeroed::<drmtap_display>(); 8];
+            let n = drmtap_list_displays(ctx, raw_displays.as_mut_ptr(), 8);
+            drmtap_close(ctx);
 
             if n <= 0 {
                 return Err(io::Error::new(
@@ -173,7 +118,7 @@ impl Display {
 }
 
 pub struct Capturer {
-    ctx: *mut ffi::drmtap_ctx,
+    ctx: *mut drmtap_ctx,
     w: usize,
     h: usize,
     buffer: Vec<u8>,
@@ -193,7 +138,7 @@ impl Capturer {
                 std::ffi::CString::new(s.as_str()).unwrap()
             });
 
-            let cfg = ffi::drmtap_config {
+            let cfg = drmtap_config {
                 device_path: device_cstr
                     .as_ref()
                     .map(|c| c.as_ptr())
@@ -202,7 +147,7 @@ impl Capturer {
                 helper_path: std::ptr::null(),
                 debug: if std::env::var("DRMTAP_DEBUG").is_ok() { 1 } else { 0 },
             };
-            let ctx = ffi::drmtap_open(&cfg);
+            let ctx = drmtap_open(&cfg);
             if ctx.is_null() {
                 return Err(io::Error::new(
                     io::ErrorKind::Other,
@@ -239,15 +184,15 @@ impl TraitCapturer for Capturer {
                 std::thread::sleep(min_interval - elapsed);
             }
 
-            let mut frame: ffi::drmtap_frame_info = std::mem::zeroed();
-            let ret = ffi::drmtap_grab_mapped(self.ctx, &mut frame);
+            let mut frame: drmtap_frame_info = std::mem::zeroed();
+            let ret = drmtap_grab_mapped(self.ctx, &mut frame);
             if ret < 0 {
                 std::thread::sleep(Duration::from_millis(16));
                 return Err(io::ErrorKind::WouldBlock.into());
             }
 
             if frame.data.is_null() || frame.width == 0 || frame.height == 0 {
-                ffi::drmtap_frame_release(self.ctx, &mut frame);
+                drmtap_frame_release(self.ctx, &mut frame);
                 std::thread::sleep(Duration::from_millis(16));
                 return Err(io::ErrorKind::WouldBlock.into());
             }
@@ -257,7 +202,7 @@ impl TraitCapturer for Capturer {
 
             // fb_id skip: if framebuffer hasn't changed, skip expensive copy
             if current_fb_id == self.last_fb_id && self.last_fb_id != 0 {
-                ffi::drmtap_frame_release(self.ctx, &mut frame);
+                drmtap_frame_release(self.ctx, &mut frame);
                 self.skip_count += 1;
                 let sleep_ms = timeout.as_millis().min(33).max(1) as u64;
                 std::thread::sleep(Duration::from_millis(sleep_ms));
@@ -287,7 +232,7 @@ impl TraitCapturer for Capturer {
                 }
             }
 
-            ffi::drmtap_frame_release(self.ctx, &mut frame);
+            drmtap_frame_release(self.ctx, &mut frame);
 
             self.frame_count += 1;
             self.w = w;
@@ -306,7 +251,7 @@ impl Drop for Capturer {
     fn drop(&mut self) {
         if !self.ctx.is_null() {
             // SAFETY: ctx was obtained from drmtap_open and is non-null.
-            unsafe { ffi::drmtap_close(self.ctx); }
+            unsafe { drmtap_close(self.ctx); }
             self.ctx = std::ptr::null_mut();
         }
     }

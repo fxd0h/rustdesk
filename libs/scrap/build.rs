@@ -217,15 +217,5 @@ fn main() {
     } else if cfg!(unix) {
         // On UNIX we pray that X11 (with XCB) is available.
         println!("cargo:rustc-cfg=x11");
-
-        // DRM/KMS capture backend: libdrmtap link search paths
-        let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
-        if target_arch == "x86_64" {
-            println!("cargo:rustc-link-search=/usr/local/lib/x86_64-linux-gnu");
-        } else if target_arch == "aarch64" {
-            println!("cargo:rustc-link-search=/usr/local/lib/aarch64-linux-gnu");
-        }
-        // Also search the default /usr/local/lib
-        println!("cargo:rustc-link-search=/usr/local/lib");
     }
 }
