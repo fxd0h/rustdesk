@@ -8,9 +8,14 @@ use crate::{
 };
 use std::{io, time::Duration};
 
+#[cfg(target_os = "linux")]
+use super::drm;
+
 pub enum Capturer {
     X11(x11::Capturer),
     WAYLAND(wayland::Capturer),
+    #[cfg(target_os = "linux")]
+    DRM(drm::Capturer),
 }
 
 impl Capturer {
@@ -18,6 +23,8 @@ impl Capturer {
         Ok(match display {
             Display::X11(d) => Capturer::X11(x11::Capturer::new(d)?),
             Display::WAYLAND(d) => Capturer::WAYLAND(wayland::Capturer::new(d)?),
+            #[cfg(target_os = "linux")]
+            Display::DRM(d) => Capturer::DRM(drm::Capturer::new(d)?),
         })
     }
 
@@ -25,6 +32,8 @@ impl Capturer {
         match self {
             Capturer::X11(d) => d.width(),
             Capturer::WAYLAND(d) => d.width(),
+            #[cfg(target_os = "linux")]
+            Capturer::DRM(d) => d.width(),
         }
     }
 
@@ -32,6 +41,8 @@ impl Capturer {
         match self {
             Capturer::X11(d) => d.height(),
             Capturer::WAYLAND(d) => d.height(),
+            #[cfg(target_os = "linux")]
+            Capturer::DRM(d) => d.height(),
         }
     }
 }
@@ -41,6 +52,8 @@ impl TraitCapturer for Capturer {
         match self {
             Capturer::X11(d) => d.frame(timeout),
             Capturer::WAYLAND(d) => d.frame(timeout),
+            #[cfg(target_os = "linux")]
+            Capturer::DRM(d) => d.frame(timeout),
         }
     }
 }
@@ -48,10 +61,19 @@ impl TraitCapturer for Capturer {
 pub enum Display {
     X11(x11::Display),
     WAYLAND(wayland::Display),
+    #[cfg(target_os = "linux")]
+    DRM(drm::Display),
 }
 
 impl Display {
     pub fn primary() -> io::Result<Display> {
+        // Try DRM first (no user consent popup, works on login screen)
+        #[cfg(target_os = "linux")]
+        if let Ok(d) = drm::Display::primary() {
+            log::info!("[DRM] Using DRM/KMS capture");
+            return Ok(Display::DRM(d));
+        }
+
         Ok(if super::is_x11() {
             Display::X11(x11::Display::primary()?)
         } else {
@@ -59,8 +81,16 @@ impl Display {
         })
     }
 
-    // Currently, wayland need to call wayland::clear() before call Display::all()
     pub fn all() -> io::Result<Vec<Display>> {
+        // Try DRM first
+        #[cfg(target_os = "linux")]
+        if let Ok(displays) = drm::Display::all() {
+            if !displays.is_empty() {
+                log::info!("[DRM] Using DRM/KMS capture ({} displays)", displays.len());
+                return Ok(displays.into_iter().map(Display::DRM).collect());
+            }
+        }
+
         Ok(if super::is_x11() {
             x11::Display::all()?
                 .drain(..)
@@ -78,6 +108,8 @@ impl Display {
         match self {
             Display::X11(d) => d.width(),
             Display::WAYLAND(d) => d.width(),
+            #[cfg(target_os = "linux")]
+            Display::DRM(d) => d.width(),
         }
     }
 
@@ -85,6 +117,8 @@ impl Display {
         match self {
             Display::X11(d) => d.height(),
             Display::WAYLAND(d) => d.height(),
+            #[cfg(target_os = "linux")]
+            Display::DRM(d) => d.height(),
         }
     }
 
@@ -92,6 +126,8 @@ impl Display {
         match self {
             Display::X11(_d) => 1.0,
             Display::WAYLAND(d) => d.scale(),
+            #[cfg(target_os = "linux")]
+            Display::DRM(d) => d.scale(),
         }
     }
 
@@ -99,6 +135,8 @@ impl Display {
         match self {
             Display::X11(d) => d.width(),
             Display::WAYLAND(d) => d.logical_width(),
+            #[cfg(target_os = "linux")]
+            Display::DRM(d) => d.logical_width(),
         }
     }
 
@@ -106,6 +144,8 @@ impl Display {
         match self {
             Display::X11(d) => d.height(),
             Display::WAYLAND(d) => d.logical_height(),
+            #[cfg(target_os = "linux")]
+            Display::DRM(d) => d.logical_height(),
         }
     }
 
@@ -113,6 +153,8 @@ impl Display {
         match self {
             Display::X11(d) => d.origin(),
             Display::WAYLAND(d) => d.origin(),
+            #[cfg(target_os = "linux")]
+            Display::DRM(d) => d.origin(),
         }
     }
 
@@ -120,6 +162,8 @@ impl Display {
         match self {
             Display::X11(d) => d.is_online(),
             Display::WAYLAND(d) => d.is_online(),
+            #[cfg(target_os = "linux")]
+            Display::DRM(d) => d.is_online(),
         }
     }
 
@@ -127,6 +171,8 @@ impl Display {
         match self {
             Display::X11(d) => d.is_primary(),
             Display::WAYLAND(d) => d.is_primary(),
+            #[cfg(target_os = "linux")]
+            Display::DRM(d) => d.is_primary(),
         }
     }
 
@@ -134,6 +180,8 @@ impl Display {
         match self {
             Display::X11(d) => d.name(),
             Display::WAYLAND(d) => d.name(),
+            #[cfg(target_os = "linux")]
+            Display::DRM(d) => d.name(),
         }
     }
 }
