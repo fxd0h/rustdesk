@@ -70,7 +70,7 @@ impl Display {
         // Try DRM first (no user consent popup, works on login screen)
         #[cfg(target_os = "linux")]
         if let Ok(d) = drm::Display::primary() {
-            log::info!("[DRM] Using DRM/KMS capture");
+            eprintln!("[DRM] Using DRM/KMS capture");
             return Ok(Display::DRM(d));
         }
 
@@ -86,7 +86,7 @@ impl Display {
         #[cfg(target_os = "linux")]
         if let Ok(displays) = drm::Display::all() {
             if !displays.is_empty() {
-                log::info!("[DRM] Using DRM/KMS capture ({} displays)", displays.len());
+                eprintln!("[DRM] Using DRM/KMS capture ({} displays)", displays.len());
                 return Ok(displays.into_iter().map(Display::DRM).collect());
             }
         }
