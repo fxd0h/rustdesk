@@ -127,7 +127,7 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Please Select the screen to be shared(Operate on the peer side).", "Please select the screen to be shared(Operate on the peer side)."),
         ("One-time Password", "One-time password"),
         ("hide_cm_tip", "Allow hiding only if accepting sessions via password and using permanent password"),
-        ("wayland_experiment_tip", "Wayland support is in experimental stage, please use X11 if you require unattended access."),
+        ("wayland_experiment_tip", "DRM/KMS direct capture is active. Wayland and X11 are both fully supported without PipeWire or portal prompts."),
         ("software_render_tip", "If you're using Nvidia graphics card under Linux and the remote window closes immediately after connecting, switching to the open-source Nouveau driver and choosing to use software rendering may help. A software restart is required."),
         ("config_input", "In order to control remote desktop with keyboard, you need to grant RustDesk \"Input Monitoring\" permissions."),
         ("config_microphone", "In order to speak remotely, you need to grant RustDesk \"Record Audio\" permissions."),
