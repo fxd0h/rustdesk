@@ -7,6 +7,10 @@ if [ "$1" = configure ]; then
 	INITSYS=$(ls -al /proc/1/exe | awk -F' ' '{print $NF}' | awk -F'/' '{print $NF}')
 	ln -f -s /usr/share/rustdesk/rustdesk /usr/bin/rustdesk
 
+	if command -v setcap >/dev/null; then
+		setcap cap_sys_admin+ep /usr/share/rustdesk/rustdesk || true
+	fi
+
 	if [ "systemd" == "$INITSYS" ]; then
 
 		if [ -e /etc/systemd/system/rustdesk.service ]; then
