@@ -1960,7 +1960,11 @@ jobs:
     name: Build appimage ${{ matrix.job.target }}
     needs: [build-rustdesk-linux]
     runs-on: ubuntu-22.04
-    if: ${{ inputs.upload-artifact }}
+    # Disabled on this fork: upstream appimage-builder fails to pip-install with
+    # modern setuptools (AttributeError: ignore_egg_info_in_manifest), which also
+    # breaks upstream's own nightly. This fork ships the .deb, not AppImages, so
+    # the job is skipped to keep CI green. Restore `inputs.upload-artifact` to re-enable.
+    if: ${{ false }}
     strategy:
       fail-fast: false
       matrix:
