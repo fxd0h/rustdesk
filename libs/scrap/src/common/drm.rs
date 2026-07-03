@@ -125,22 +125,32 @@ pub fn capture_available() -> bool {
     }
 }
 
-// Open a context on the auto-selected active CRTC (crtc_id 0) and attempt a
-// single grab, tolerating a few transient errors before the first frame.
-unsafe fn capture_probe() -> ProbeResult {
-    let device_env = std::env::var("DRM_DEVICE").ok();
-    let device_cstr = device_env
-        .as_ref()
-        .and_then(|s| std::ffi::CString::new(s.as_str()).ok());
+// Build a drmtap_config for the given CRTC. Returns the owned DRM_DEVICE CString
+// alongside the config that borrows it: the caller MUST keep the CString alive
+// for as long as it uses the config (bind it, don't drop it). Centralised so the
+// three open sites (probe, enumerate, capture) can't drift on device/debug
+// handling. DRM_DEVICE is user-controlled, so an interior NUL is treated as unset
+// (null device_path) rather than panicking.
+fn build_drm_config(crtc_id: u32) -> (Option<std::ffi::CString>, drmtap_config) {
+    let device_cstr = std::env::var("DRM_DEVICE")
+        .ok()
+        .and_then(|s| std::ffi::CString::new(s).ok());
     let cfg = drmtap_config {
         device_path: device_cstr
             .as_ref()
             .map(|c| c.as_ptr())
             .unwrap_or(std::ptr::null()),
-        crtc_id: 0,
+        crtc_id,
         helper_path: std::ptr::null(),
         debug: if std::env::var("DRMTAP_DEBUG").is_ok() { 1 } else { 0 },
     };
+    (device_cstr, cfg)
+}
+
+// Open a context on the auto-selected active CRTC (crtc_id 0) and attempt a
+// single grab, tolerating a few transient errors before the first frame.
+unsafe fn capture_probe() -> ProbeResult {
+    let (_device_cstr, cfg) = build_drm_config(0);
     let ctx = drmtap_open(&cfg);
     if ctx.is_null() {
         // open() can fail because there is no active CRTC yet (DPMS/topology)
@@ -292,22 +302,7 @@ impl Display {
         // SAFETY: All FFI calls use valid pointers and check return values.
         // The drmtap context is opened and closed within this function scope.
         unsafe {
-            let device_env = std::env::var("DRM_DEVICE").ok();
-            // DRM_DEVICE is user-controlled; an interior NUL would make CString::new
-            // fail — treat that as unset (null device_path) rather than panicking.
-            let device_cstr = device_env
-                .as_ref()
-                .and_then(|s| std::ffi::CString::new(s.as_str()).ok());
-
-            let cfg = drmtap_config {
-                device_path: device_cstr
-                    .as_ref()
-                    .map(|c| c.as_ptr())
-                    .unwrap_or(std::ptr::null()),
-                crtc_id: 0,
-                helper_path: std::ptr::null(),
-                debug: if std::env::var("DRMTAP_DEBUG").is_ok() { 1 } else { 0 },
-            };
+            let (_device_cstr, cfg) = build_drm_config(0);
             let ctx = drmtap_open(&cfg);
             if ctx.is_null() {
                 return Err(io::Error::new(
@@ -428,22 +423,7 @@ impl Capturer {
         // SAFETY: FFI call to drmtap_open with valid config struct.
         // The returned pointer is checked for null before use.
         unsafe {
-            let device_env = std::env::var("DRM_DEVICE").ok();
-            // DRM_DEVICE is user-controlled; an interior NUL would make CString::new
-            // fail — treat that as unset (null device_path) rather than panicking.
-            let device_cstr = device_env
-                .as_ref()
-                .and_then(|s| std::ffi::CString::new(s.as_str()).ok());
-
-            let cfg = drmtap_config {
-                device_path: device_cstr
-                    .as_ref()
-                    .map(|c| c.as_ptr())
-                    .unwrap_or(std::ptr::null()),
-                crtc_id: display.crtc_id,
-                helper_path: std::ptr::null(),
-                debug: if std::env::var("DRMTAP_DEBUG").is_ok() { 1 } else { 0 },
-            };
+            let (_device_cstr, cfg) = build_drm_config(display.crtc_id);
             let ctx = drmtap_open(&cfg);
             if ctx.is_null() {
                 return Err(io::Error::new(
