@@ -2323,13 +2323,21 @@ pub fn is_drm_capture_available() -> bool {
             "/usr/bin/drmtap-helper",
             "/usr/lib/drmtap/drmtap-helper",
         ];
-        // The helper is installed mode 0750 root:rustdesk-capture, so mere
-        // existence does not mean *this* user can run it. Check execute access
-        // for the real uid/gid — access() honours supplementary groups, so a
-        // user in rustdesk-capture (or root, e.g. the service) passes while a
-        // user outside the group does not. Otherwise the UI would advertise
-        // no-consent DRM capture to users who silently fall back to PipeWire.
-        HELPER_PATHS.iter().any(|p| helper_executable(p))
+        // Cheap gate first: the helper is installed 0750 root:rustdesk-capture,
+        // so mere existence does not mean *this* user can run it. access() checks
+        // execute permission for the real uid/gid (honouring supplementary
+        // groups), so a user outside rustdesk-capture is ruled out without
+        // forking anything.
+        if !HELPER_PATHS.iter().any(|p| helper_executable(p)) {
+            return false;
+        }
+        // Authoritative check: the same probe the capture path uses. Executable
+        // is necessary but not sufficient — the helper can be runnable yet lack
+        // the file capability (setcap never applied), in which case a real grab
+        // still fails and capture falls back to PipeWire. Reusing the probe (its
+        // result is cached) keeps the UI status aligned with what capture does,
+        // instead of advertising no-consent DRM that won't actually engage.
+        scrap::drm_capture_available()
     }
     #[cfg(not(feature = "drm"))]
     false

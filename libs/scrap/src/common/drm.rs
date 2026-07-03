@@ -66,10 +66,22 @@ fn is_transient_errno(ret: i32) -> bool {
     matches!(-ret, libc::EAGAIN | libc::EBUSY | libc::EINTR | libc::ETIMEDOUT)
 }
 
+// Errnos that mean the privileged helper itself cannot run / is not set up
+// (execute denied, missing helper). These are fixed for the process lifetime —
+// group membership, the file capability, and the install are all decided before
+// the process starts — so a probe seeing them is safe to cache. Everything else
+// that is neither success nor transient — notably ENODEV (CRTC inactive /
+// display asleep under DPMS) — is a topology condition that can clear, and must
+// stay retryable, or a monitor that happens to be asleep at startup would leave
+// DRM disabled until the process restarts.
+fn is_setup_errno(ret: i32) -> bool {
+    matches!(-ret, libc::EACCES | libc::EPERM | libc::ENOENT)
+}
+
 enum ProbeResult {
     Ok,
-    Permanent,  // helper denied, CRTC gone, unsupported — will not recover
-    Transient,  // busy/interrupted/no-frame-yet — may recover shortly
+    Permanent,  // helper cannot run / not set up (denied, missing) — cache it
+    Transient,  // busy, no-frame-yet, or topology (CRTC asleep) — retry later
 }
 
 // Whether DRM/KMS capture actually works on this host, i.e. the privileged
@@ -131,9 +143,10 @@ unsafe fn capture_probe() -> ProbeResult {
     };
     let ctx = drmtap_open(&cfg);
     if ctx.is_null() {
-        // open() itself failing (no device, helper cannot be set up) is not
-        // going to fix itself within this process — treat as permanent.
-        return ProbeResult::Permanent;
+        // open() can fail because there is no active CRTC yet (DPMS/topology)
+        // just as easily as for a real setup problem, so don't cache it — the
+        // next enumeration re-probes.
+        return ProbeResult::Transient;
     }
     let mut result = ProbeResult::Transient;
     for _ in 0..8 {
@@ -144,11 +157,19 @@ unsafe fn capture_probe() -> ProbeResult {
             result = ProbeResult::Ok;
             break;
         }
-        if !is_transient_errno(ret) {
-            result = ProbeResult::Permanent; // helper denied, CRTC gone, etc.
-            break;
+        if is_transient_errno(ret) {
+            std::thread::sleep(Duration::from_millis(10));
+            continue;
         }
-        std::thread::sleep(Duration::from_millis(10));
+        // Non-transient: cache only a genuine helper/setup failure; leave a
+        // topology failure (ENODEV = CRTC asleep/gone) retryable so a display
+        // that is merely asleep at startup doesn't disable DRM for good.
+        result = if is_setup_errno(ret) {
+            ProbeResult::Permanent
+        } else {
+            ProbeResult::Transient
+        };
+        break;
     }
     drmtap_close(ctx);
     result
