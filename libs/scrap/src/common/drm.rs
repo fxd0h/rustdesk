@@ -16,8 +16,9 @@
 
 use crate::{Frame, TraitCapturer};
 use std::{io, time::{Duration, Instant}};
+use std::sync::atomic::{AtomicU8, Ordering};
 use super::x11::PixelBuffer;
-use hbb_common::log;
+use hbb_common::{libc, log};
 
 // FFI bindings to libdrmtap — struct layouts must match drmtap.h exactly!
 // Use libdrmtap-sys crate for static linking
@@ -54,6 +55,103 @@ pub fn drm_cursor() -> Option<DrmCursor> {
 /// the id to detect shape changes — avoids cloning the pixel buffer every poll.
 pub fn drm_cursor_id() -> Option<u64> {
     DRM_CURSOR.lock().unwrap().as_ref().map(|c| c.id)
+}
+
+// A grab that returns one of these errnos may succeed on retry (no frame ready,
+// helper busy, interrupted syscall). Anything else negative is a permanent
+// failure — the helper can't run (EACCES), the CRTC is gone (ENODEV), the format
+// is unsupported, etc. — and must NOT be retried as WouldBlock, or the capture
+// loop spins forever on a blank frame instead of falling back to PipeWire.
+fn is_transient_errno(ret: i32) -> bool {
+    matches!(-ret, libc::EAGAIN | libc::EBUSY | libc::EINTR | libc::ETIMEDOUT)
+}
+
+enum ProbeResult {
+    Ok,
+    Permanent,  // helper denied, CRTC gone, unsupported — will not recover
+    Transient,  // busy/interrupted/no-frame-yet — may recover shortly
+}
+
+// Whether DRM/KMS capture actually works on this host, i.e. the privileged
+// helper is reachable and a scanout grab succeeds.
+//
+// Display enumeration (drmtap_list_displays) only reads connectors/CRTCs, which
+// is unprivileged and succeeds even when the helper cannot run — e.g. the user
+// is not in the `rustdesk-capture` group, or `setcap` was never applied. So the
+// display list alone is not proof that capture will work. This probes an actual
+// grab and caches only *definitive* outcomes for the process lifetime (helper
+// reachability and group membership are fixed when the process starts, and we
+// must not fork a helper on every enumeration). An inconclusive/transient probe
+// is not cached, so a momentary compositor blip at init can't lock DRM off for
+// the whole process — it just uses PipeWire this once and re-probes next time.
+// The dispatcher (common/linux.rs) gates the DRM path on this so an unusable
+// helper falls back to PipeWire/portal cleanly instead of streaming blank.
+pub fn capture_available() -> bool {
+    static PROBE: AtomicU8 = AtomicU8::new(0); // 0 = unknown, 1 = ok, 2 = failed
+    match PROBE.load(Ordering::Relaxed) {
+        1 => return true,
+        2 => return false,
+        _ => {}
+    }
+    match unsafe { capture_probe() } {
+        ProbeResult::Ok => {
+            PROBE.store(1, Ordering::Relaxed);
+            log::info!("DRM/KMS capture probe succeeded");
+            true
+        }
+        ProbeResult::Permanent => {
+            PROBE.store(2, Ordering::Relaxed);
+            log::info!("DRM/KMS capture probe failed (helper unavailable); using PipeWire/portal");
+            false
+        }
+        ProbeResult::Transient => {
+            log::debug!(
+                "DRM/KMS capture probe inconclusive (transient); using PipeWire/portal for now, will re-probe"
+            );
+            false
+        }
+    }
+}
+
+// Open a context on the auto-selected active CRTC (crtc_id 0) and attempt a
+// single grab, tolerating a few transient errors before the first frame.
+unsafe fn capture_probe() -> ProbeResult {
+    let device_env = std::env::var("DRM_DEVICE").ok();
+    let device_cstr = device_env
+        .as_ref()
+        .and_then(|s| std::ffi::CString::new(s.as_str()).ok());
+    let cfg = drmtap_config {
+        device_path: device_cstr
+            .as_ref()
+            .map(|c| c.as_ptr())
+            .unwrap_or(std::ptr::null()),
+        crtc_id: 0,
+        helper_path: std::ptr::null(),
+        debug: if std::env::var("DRMTAP_DEBUG").is_ok() { 1 } else { 0 },
+    };
+    let ctx = drmtap_open(&cfg);
+    if ctx.is_null() {
+        // open() itself failing (no device, helper cannot be set up) is not
+        // going to fix itself within this process — treat as permanent.
+        return ProbeResult::Permanent;
+    }
+    let mut result = ProbeResult::Transient;
+    for _ in 0..8 {
+        let mut frame: drmtap_frame_info = std::mem::zeroed();
+        let ret = drmtap_grab_mapped(ctx, &mut frame);
+        if ret == 0 {
+            drmtap_frame_release(ctx, &mut frame);
+            result = ProbeResult::Ok;
+            break;
+        }
+        if !is_transient_errno(ret) {
+            result = ProbeResult::Permanent; // helper denied, CRTC gone, etc.
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    drmtap_close(ctx);
+    result
 }
 
 pub struct Display {
@@ -148,6 +246,16 @@ fn primary_display_index(displays: &[Display]) -> usize {
     #[cfg(feature = "wayland")]
     if let Some(name) = crate::wayland::display::get_primary_monitor() {
         if let Some(idx) = displays.iter().position(|d| d.name == name) {
+            return idx;
+        }
+        // The compositor often shortens connector names (Mutter reports "HDMI-1"
+        // while DRM enumerates "HDMI-A-1"), so an exact compare misses. Fall back
+        // to the same normalized match used for logical geometry before giving up.
+        let want = normalize_connector(&name);
+        if let Some(idx) = displays
+            .iter()
+            .position(|d| normalize_connector(&d.name) == want)
+        {
             return idx;
         }
         log::debug!(
@@ -289,10 +397,8 @@ pub struct Capturer {
     w: usize,
     h: usize,
     buffer: Vec<u8>,
-    last_fb_id: u32,
     frame_count: u64,
     cursor_tick: u64,
-    skip_count: u64,
     last_grab_time: Instant,
 }
 
@@ -329,10 +435,8 @@ impl Capturer {
                 w: display.w,
                 h: display.h,
                 buffer: Vec::new(),
-                last_fb_id: 0,
                 frame_count: 0,
                 cursor_tick: 0,
-                skip_count: 0,
                 last_grab_time: Instant::now(),
             })
         }
@@ -343,7 +447,7 @@ impl Capturer {
 }
 
 impl TraitCapturer for Capturer {
-    fn frame<'a>(&'a mut self, timeout: Duration) -> io::Result<Frame<'a>> {
+    fn frame<'a>(&'a mut self, _timeout: Duration) -> io::Result<Frame<'a>> {
         // SAFETY: All FFI calls use the valid self.ctx pointer (checked non-null
         // in new()). Frame data pointer is validated before dereferencing.
         // drmtap_frame_release is always called before returning.
@@ -358,8 +462,18 @@ impl TraitCapturer for Capturer {
             let mut frame: drmtap_frame_info = std::mem::zeroed();
             let ret = drmtap_grab_mapped(self.ctx, &mut frame);
             if ret < 0 {
-                std::thread::sleep(Duration::from_millis(16));
-                return Err(io::ErrorKind::WouldBlock.into());
+                if is_transient_errno(ret) {
+                    std::thread::sleep(Duration::from_millis(16));
+                    return Err(io::ErrorKind::WouldBlock.into());
+                }
+                // Permanent failure (helper denied, CRTC/display gone, format
+                // unsupported). Surface a hard error instead of WouldBlock so the
+                // capture loop tears down and the server can fall back, rather
+                // than retrying forever on a frame that will never arrive.
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("drmtap_grab_mapped failed: errno {}", -ret),
+                ));
             }
 
             if frame.data.is_null() || frame.width == 0 || frame.height == 0 {
@@ -369,7 +483,6 @@ impl TraitCapturer for Capturer {
             }
 
             self.last_grab_time = Instant::now();
-            let current_fb_id = frame.fb_id;
 
             // Poll the hardware cursor plane independently of framebuffer changes.
             // The cursor plane is a separate DRM plane — its shape can change even
@@ -380,16 +493,13 @@ impl TraitCapturer for Capturer {
                 self.update_cursor();
             }
 
-            // fb_id skip: if framebuffer hasn't changed, skip expensive copy
-            if current_fb_id == self.last_fb_id && self.last_fb_id != 0 {
-                drmtap_frame_release(self.ctx, &mut frame);
-                self.skip_count += 1;
-                let sleep_ms = timeout.as_millis().min(33).max(1) as u64;
-                std::thread::sleep(Duration::from_millis(sleep_ms));
-                return Err(io::ErrorKind::WouldBlock.into());
-            }
-            self.last_fb_id = current_fb_id;
-
+            // NB: we do NOT skip on an unchanged fb_id. A constant KMS framebuffer
+            // id does not imply constant pixels — a compositor can re-render into
+            // (or reuse) the current scanout buffer without allocating a new one,
+            // so gating the copy on fb_id froze the remote display after the first
+            // frame on those compositors. Deliver every grabbed frame and let the
+            // encoder collapse static content into near-empty inter-frames; the
+            // 16ms rate limit above (plus adaptive QoS FPS) bounds the cost.
             let w = frame.width as usize;
             let h = frame.height as usize;
             let stride = frame.stride as usize;

@@ -1569,6 +1569,10 @@ class RustdeskImpl {
     return false;
   }
 
+  bool mainIsDrmCaptureAvailable({dynamic hint}) {
+    return false;
+  }
+
   bool mainHideDock({dynamic hint}) {
     throw UnimplementedError("mainHideDock");
   }

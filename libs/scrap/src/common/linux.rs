@@ -71,9 +71,11 @@ impl Display {
     pub fn primary() -> io::Result<Display> {
         // On Wayland: try DRM/KMS first — no portal consent dialog, works at
         // the login screen. Falls back to PipeWire/portal if DRM is unavailable
-        // (helper missing, no active CRTC, etc.).
+        // (helper missing, no active CRTC, etc.). capture_available() probes an
+        // actual grab so we don't select DRM when enumeration succeeds but the
+        // privileged helper can't run — otherwise capture would stream blank.
         #[cfg(all(target_os = "linux", feature = "drm"))]
-        if !super::is_x11() {
+        if !super::is_x11() && drm::capture_available() {
             match drm::Display::primary() {
                 Ok(d) => {
                     log::info!("DRM/KMS capture active");
@@ -95,7 +97,7 @@ impl Display {
     pub fn all() -> io::Result<Vec<Display>> {
         // On Wayland: try DRM/KMS first (see primary() for rationale).
         #[cfg(all(target_os = "linux", feature = "drm"))]
-        if !super::is_x11() {
+        if !super::is_x11() && drm::capture_available() {
             match drm::Display::all() {
                 Ok(displays) if !displays.is_empty() => {
                     log::info!("DRM/KMS capture active ({} display(s))", displays.len());

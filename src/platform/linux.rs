@@ -2323,10 +2323,25 @@ pub fn is_drm_capture_available() -> bool {
             "/usr/bin/drmtap-helper",
             "/usr/lib/drmtap/drmtap-helper",
         ];
-        HELPER_PATHS.iter().any(|p| std::path::Path::new(p).exists())
+        // The helper is installed mode 0750 root:rustdesk-capture, so mere
+        // existence does not mean *this* user can run it. Check execute access
+        // for the real uid/gid — access() honours supplementary groups, so a
+        // user in rustdesk-capture (or root, e.g. the service) passes while a
+        // user outside the group does not. Otherwise the UI would advertise
+        // no-consent DRM capture to users who silently fall back to PipeWire.
+        HELPER_PATHS.iter().any(|p| helper_executable(p))
     }
     #[cfg(not(feature = "drm"))]
     false
+}
+
+#[cfg(feature = "drm")]
+fn helper_executable(path: &str) -> bool {
+    use hbb_common::libc;
+    match std::ffi::CString::new(path) {
+        Ok(c) => unsafe { libc::access(c.as_ptr(), libc::X_OK) == 0 },
+        Err(_) => false,
+    }
 }
 
 #[inline]
