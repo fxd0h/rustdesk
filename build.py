@@ -297,7 +297,7 @@ def get_features(args):
     return features
 
 
-def generate_control_file(version):
+def generate_control_file(version, extra_depends=""):
     control_file_path = "../res/DEBIAN/control"
     system2('/bin/rm -rf %s' % control_file_path)
 
@@ -308,11 +308,11 @@ Version: %s
 Architecture: %s
 Maintainer: rustdesk <info@rustdesk.com>
 Homepage: https://rustdesk.com
-Depends: libgtk-3-0t64 | libgtk-3-0, libxcb-randr0, libxdo3 | libxdo4, libxfixes3, libxcb-shape0, libxcb-xfixes0, libasound2t64 | libasound2, libsystemd0, curl, libva2, libva-drm2, libva-x11-2, libgstreamer-plugins-base1.0-0, libpam0g, gstreamer1.0-pipewire%s
+Depends: libgtk-3-0t64 | libgtk-3-0, libxcb-randr0, libxdo3 | libxdo4, libxfixes3, libxcb-shape0, libxcb-xfixes0, libasound2t64 | libasound2, libsystemd0, curl, libva2, libva-drm2, libva-x11-2, libgstreamer-plugins-base1.0-0, libpam0g, gstreamer1.0-pipewire%s%s
 Recommends: libayatana-appindicator3-1
 Description: A remote control software.
 
-""" % (version, get_deb_arch(), get_deb_extra_depends())
+""" % (version, get_deb_arch(), get_deb_extra_depends(), extra_depends)
     file = open(control_file_path, "w")
     file.write(content)
     file.close()
@@ -364,12 +364,15 @@ def build_flutter_deb(version, features):
     # when this build actually enabled the `drm` feature. Gating on the feature
     # (not on whether a stale ../target/release/drmtap-helper happens to exist
     # from an earlier --drm build) keeps the opt-in guarantee for normal packages.
-    if 'drm' in features:
+    ships_helper = 'drm' in features
+    if ships_helper:
         system2('mkdir -p tmpdeb/usr/lib/rustdesk')
         system2('cp ../target/release/drmtap-helper tmpdeb/usr/lib/rustdesk/drmtap-helper')
 
     system2('mkdir -p tmpdeb/DEBIAN')
-    generate_control_file(version)
+    # postinst runs setcap (from libcap2-bin) on the helper; make it a hard
+    # dependency so a DRM package can't install an unusable, cap-less helper.
+    generate_control_file(version, ", libcap2-bin" if ships_helper else "")
     system2('cp -a ../res/DEBIAN/* tmpdeb/DEBIAN/')
     md5_file_folder("tmpdeb/")
     system2('dpkg-deb -b tmpdeb rustdesk.deb;')
@@ -415,7 +418,10 @@ def build_deb_from_folder(version, binary_folder):
     system2('if [ -f tmpdeb/usr/share/rustdesk/drmtap-helper ]; then mv tmpdeb/usr/share/rustdesk/drmtap-helper tmpdeb/usr/lib/rustdesk/drmtap-helper; fi')
 
     system2('mkdir -p tmpdeb/DEBIAN')
-    generate_control_file(version)
+    # Only a bundle staged with the DRM helper needs libcap2-bin (postinst runs
+    # setcap on it); detect it in the payload so plain bundles stay unaffected.
+    ships_helper = os.path.exists('tmpdeb/usr/lib/rustdesk/drmtap-helper')
+    generate_control_file(version, ", libcap2-bin" if ships_helper else "")
     system2('cp -a ../res/DEBIAN/* tmpdeb/DEBIAN/')
     md5_file_folder("tmpdeb/")
     system2('dpkg-deb -b tmpdeb rustdesk.deb;')

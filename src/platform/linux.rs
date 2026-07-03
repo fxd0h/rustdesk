@@ -2323,10 +2323,33 @@ pub fn is_drm_capture_available() -> bool {
             "/usr/bin/drmtap-helper",
             "/usr/lib/drmtap/drmtap-helper",
         ];
-        HELPER_PATHS.iter().any(|p| std::path::Path::new(p).exists())
+        // Cheap gate first: the helper is installed 0750 root:rustdesk-capture,
+        // so mere existence does not mean *this* user can run it. access() checks
+        // execute permission for the real uid/gid (honouring supplementary
+        // groups), so a user outside rustdesk-capture is ruled out without
+        // forking anything.
+        if !HELPER_PATHS.iter().any(|p| helper_executable(p)) {
+            return false;
+        }
+        // Authoritative check: the same probe the capture path uses. Executable
+        // is necessary but not sufficient — the helper can be runnable yet lack
+        // the file capability (setcap never applied), in which case a real grab
+        // still fails and capture falls back to PipeWire. Reusing the probe (its
+        // result is cached) keeps the UI status aligned with what capture does,
+        // instead of advertising no-consent DRM that won't actually engage.
+        scrap::drm_capture_available()
     }
     #[cfg(not(feature = "drm"))]
     false
+}
+
+#[cfg(feature = "drm")]
+fn helper_executable(path: &str) -> bool {
+    use hbb_common::libc;
+    match std::ffi::CString::new(path) {
+        Ok(c) => unsafe { libc::access(c.as_ptr(), libc::X_OK) == 0 },
+        Err(_) => false,
+    }
 }
 
 #[inline]
