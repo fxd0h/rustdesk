@@ -99,7 +99,6 @@ enum ProbeResult {
 // The dispatcher (common/linux.rs) gates the DRM path on this so an unusable
 // helper falls back to PipeWire/portal cleanly instead of streaming blank.
 pub fn capture_available() -> bool {
-    static PROBE: AtomicU8 = AtomicU8::new(0); // 0 = unknown, 1 = ok, 2 = failed
     match PROBE.load(Ordering::Relaxed) {
         1 => return true,
         2 => return false,
@@ -122,6 +121,50 @@ pub fn capture_available() -> bool {
             );
             false
         }
+    }
+}
+
+// Process-wide DRM availability cache. Written once by the startup probe and
+// DOWNGRADED by runtime failures (see `Capturer::frame`): a setup failure sets it
+// to 2 (permanently unavailable — the helper can't run at all); any other hard
+// grab failure resets it to 0 so the next enumeration re-probes instead of
+// trusting a stale OK. 0 = unknown, 1 = ok, 2 = permanently unavailable.
+static PROBE: AtomicU8 = AtomicU8::new(0);
+
+// CRTCs that returned a permanent, *attributable* grab failure at runtime (e.g. a
+// secondary output whose scanout format can't be captured). Keyed by connector
+// name + crtc id — a bare crtc id isn't stable across a replug, so pairing it with
+// the connector name avoids a stale id later matching a healthy monitor. Such a
+// display is DROPPED from DRM enumeration so the rest keep DRM (whole-session
+// fallback to PipeWire is useless on an unattended host — nobody clicks consent).
+// Cleared whenever the enumerated topology changes (replug/wake), re-testing all.
+// ENODEV (asleep/gone) never enters this set: the enumeration `active` filter
+// already excludes those, and bad-marking a nap would outlive it for no benefit.
+static BAD_CRTCS: Mutex<Vec<(String, u32)>> = Mutex::new(Vec::new());
+static LAST_TOPOLOGY: Mutex<Vec<(String, u32)>> = Mutex::new(Vec::new());
+
+fn mark_bad_crtc(name: &str, crtc_id: u32) {
+    let mut bad = BAD_CRTCS.lock().unwrap();
+    if !bad.iter().any(|(n, c)| n == name && *c == crtc_id) {
+        bad.push((name.to_string(), crtc_id));
+    }
+}
+
+fn is_bad_crtc(name: &str, crtc_id: u32) -> bool {
+    BAD_CRTCS
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(n, c)| n == name && *c == crtc_id)
+}
+
+// A replug/wake/reconfigure changes the enumerated (connector, crtc) set; when it
+// does, forget past per-CRTC failures and re-test everything.
+fn reset_bad_crtcs_on_topology_change(current: &[(String, u32)]) {
+    let mut last = LAST_TOPOLOGY.lock().unwrap();
+    if last.as_slice() != current {
+        BAD_CRTCS.lock().unwrap().clear();
+        *last = current.to_vec();
     }
 }
 
@@ -378,6 +421,21 @@ impl Display {
                 ));
             }
 
+            // Drop CRTCs that a runtime grab marked permanently ungrabbable, so the
+            // rest keep DRM rather than the whole session dropping to PipeWire
+            // (useless unattended). Clear the set first when the enumerated topology
+            // changed, so a replug/wake re-tests everything.
+            let topology: Vec<(String, u32)> =
+                displays.iter().map(|d| (d.name.clone(), d.crtc_id)).collect();
+            reset_bad_crtcs_on_topology_change(&topology);
+            displays.retain(|d| !is_bad_crtc(&d.name, d.crtc_id));
+            if displays.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "All DRM CRTCs ungrabbable; falling back to PipeWire",
+                ));
+            }
+
             // Mark the primary to match the compositor's primary output (by
             // connector name) rather than libdrmtap's enumeration order. Falls
             // back to the first display if the compositor primary is unknown or
@@ -416,6 +474,11 @@ pub struct Capturer {
     frame_count: u64,
     cursor_tick: u64,
     last_grab_time: Instant,
+    // Identity of the CRTC being captured, so a runtime grab failure can be
+    // attributed to a specific display (see frame()). crtc_id 0 = auto-select,
+    // not a stable identity, so failures on it are treated as global, not per-CRTC.
+    name: String,
+    crtc_id: u32,
 }
 
 impl Capturer {
@@ -439,6 +502,8 @@ impl Capturer {
                 frame_count: 0,
                 cursor_tick: 0,
                 last_grab_time: Instant::now(),
+                name: display.name,
+                crtc_id: display.crtc_id,
             })
         }
     }
@@ -467,10 +532,29 @@ impl TraitCapturer for Capturer {
                     std::thread::sleep(Duration::from_millis(16));
                     return Err(io::ErrorKind::WouldBlock.into());
                 }
-                // Permanent failure (helper denied, CRTC/display gone, format
-                // unsupported). Surface a hard error instead of WouldBlock so the
-                // capture loop tears down and the server can fall back, rather
-                // than retrying forever on a frame that will never arrive.
+                // Non-transient hard failure. Classify so the next enumeration
+                // does the right thing, then surface a hard error so the capture
+                // loop tears down now instead of spinning WouldBlock on a frame
+                // that will never arrive:
+                //   - setup errno (helper can't run at all) -> permanently
+                //     unavailable; PROBE=2 so DRM is not re-selected this process.
+                //   - otherwise -> reset PROBE so the next enumeration re-probes
+                //     (a healthy primary comes right back), and if the failure is
+                //     attributable to a specific CRTC (not ENODEV/topology, and a
+                //     real crtc id, not auto-select 0), mark that CRTC bad so it is
+                //     dropped from DRM enumeration while the rest keep DRM.
+                if is_setup_errno(ret) {
+                    PROBE.store(2, Ordering::Relaxed);
+                } else {
+                    PROBE.store(0, Ordering::Relaxed);
+                    if -ret != libc::ENODEV && self.crtc_id != 0 {
+                        log::warn!(
+                            "DRM/KMS: grab on '{}' (crtc {}) failed permanently (errno {}); dropping it from DRM, keeping DRM for the rest",
+                            self.name, self.crtc_id, -ret
+                        );
+                        mark_bad_crtc(&self.name, self.crtc_id);
+                    }
+                }
                 return Err(io::Error::new(
                     io::ErrorKind::Other,
                     format!("drmtap_grab_mapped failed: errno {}", -ret),
