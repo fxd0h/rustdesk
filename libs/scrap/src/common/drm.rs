@@ -159,12 +159,17 @@ fn is_bad_crtc(name: &str, crtc_id: u32) -> bool {
 }
 
 // A replug/wake/reconfigure changes the enumerated (connector, crtc) set; when it
-// does, forget past per-CRTC failures and re-test everything.
+// does, forget past per-CRTC failures and re-test everything. Canonicalize by
+// sorting first: drmtap_list_displays / DRM connector order isn't guaranteed
+// stable, so a bare reorder must NOT read as a topology change (that would clear
+// the bad set and reintroduce a just-failed CRTC).
 fn reset_bad_crtcs_on_topology_change(current: &[(String, u32)]) {
+    let mut sorted = current.to_vec();
+    sorted.sort();
     let mut last = LAST_TOPOLOGY.lock().unwrap();
-    if last.as_slice() != current {
+    if last.as_slice() != sorted.as_slice() {
         BAD_CRTCS.lock().unwrap().clear();
-        *last = current.to_vec();
+        *last = sorted;
     }
 }
 

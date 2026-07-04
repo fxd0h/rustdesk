@@ -424,10 +424,21 @@ fn scale_tagged_cursor_id(raw: u64) -> u64 {
 mod cursor_downscale_tests {
     use super::*;
 
-    // A scale change must change the tagged cursor id (so MouseCursorService
-    // re-fetches), while the same scale must keep it stable (no re-fetch churn).
+    // One test, not two: both exercise the process-global CURSOR_DOWNSCALE_BITS,
+    // so keeping them in a single test keeps them sequential and race-free without
+    // pulling in a serial-test harness.
     #[test]
-    fn scale_change_invalidates_cursor_id() {
+    fn cursor_downscale_behaviour() {
+        // set_cursor_downscale clamps: only > 1.0 is kept; anything else is 1.0.
+        set_cursor_downscale(0.5);
+        assert_eq!(cursor_downscale(), 1.0);
+        set_cursor_downscale(f64::NAN);
+        assert_eq!(cursor_downscale(), 1.0);
+        set_cursor_downscale(2.0);
+        assert_eq!(cursor_downscale(), 2.0);
+
+        // A scale change must change the tagged cursor id (so MouseCursorService
+        // re-fetches), while the same scale must keep it stable (no re-fetch churn).
         let raw = 0x0123_4567_89AB_CDEFu64;
         set_cursor_downscale(1.0);
         let id_1x = scale_tagged_cursor_id(raw);
@@ -436,18 +447,6 @@ mod cursor_downscale_tests {
         assert_ne!(id_1x, id_2x, "scale change should change the cursor id");
         set_cursor_downscale(1.0);
         assert_eq!(id_1x, scale_tagged_cursor_id(raw), "same scale, same id");
-    }
-
-    // set_cursor_downscale clamps: only > 1.0 is kept; anything else is 1.0.
-    #[test]
-    fn downscale_clamps_below_one() {
-        set_cursor_downscale(0.5);
-        assert_eq!(cursor_downscale(), 1.0);
-        set_cursor_downscale(f64::NAN);
-        assert_eq!(cursor_downscale(), 1.0);
-        set_cursor_downscale(2.0);
-        assert_eq!(cursor_downscale(), 2.0);
-        set_cursor_downscale(1.0); // reset for other tests
     }
 }
 
