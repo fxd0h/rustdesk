@@ -364,7 +364,7 @@ pub fn get_cursor() -> ResultType<Option<u64>> {
     #[cfg(feature = "drm")]
     if !is_x11() {
         if let Some(id) = scrap::drm_cursor_id() {
-            return Ok(Some(id));
+            return Ok(Some(scale_tagged_cursor_id(id)));
         }
     }
     let mut res = None;
@@ -374,7 +374,7 @@ pub fn get_cursor() -> ResultType<Option<u64>> {
                 unsafe {
                     let img = XFixesGetCursorImage(*d);
                     if !img.is_null() {
-                        res = Some((*img).cursor_serial as u64);
+                        res = Some(scale_tagged_cursor_id((*img).cursor_serial as u64));
                         XFree(img as _);
                     }
                 }
@@ -406,6 +406,47 @@ fn cursor_downscale() -> f64 {
         1.0
     } else {
         f64::from_bits(b)
+    }
+}
+
+// Fold the current cursor downscale into a cursor id. MouseCursorService only
+// re-fetches get_cursor_data() when get_cursor()'s id changes, so if the scale
+// changes (e.g. capture switches to a different-DPI monitor) while the cursor
+// SHAPE is unchanged, the client would otherwise keep the old, wrong-sized image.
+// Tagging the id with the scale makes a scale change look like a new cursor.
+// get_cursor() and get_cursor_data() must tag identically so their ids match.
+fn scale_tagged_cursor_id(raw: u64) -> u64 {
+    let q = (cursor_downscale() * 256.0).round() as u64; // quantized; 1.0 -> 256
+    raw ^ q.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+}
+
+#[cfg(test)]
+mod cursor_downscale_tests {
+    use super::*;
+
+    // One test, not two: both exercise the process-global CURSOR_DOWNSCALE_BITS,
+    // so keeping them in a single test keeps them sequential and race-free without
+    // pulling in a serial-test harness.
+    #[test]
+    fn cursor_downscale_behaviour() {
+        // set_cursor_downscale clamps: only > 1.0 is kept; anything else is 1.0.
+        set_cursor_downscale(0.5);
+        assert_eq!(cursor_downscale(), 1.0);
+        set_cursor_downscale(f64::NAN);
+        assert_eq!(cursor_downscale(), 1.0);
+        set_cursor_downscale(2.0);
+        assert_eq!(cursor_downscale(), 2.0);
+
+        // A scale change must change the tagged cursor id (so MouseCursorService
+        // re-fetches), while the same scale must keep it stable (no re-fetch churn).
+        let raw = 0x0123_4567_89AB_CDEFu64;
+        set_cursor_downscale(1.0);
+        let id_1x = scale_tagged_cursor_id(raw);
+        set_cursor_downscale(2.0);
+        let id_2x = scale_tagged_cursor_id(raw);
+        assert_ne!(id_1x, id_2x, "scale change should change the cursor id");
+        set_cursor_downscale(1.0);
+        assert_eq!(id_1x, scale_tagged_cursor_id(raw), "same scale, same id");
     }
 }
 
@@ -444,7 +485,7 @@ pub fn get_cursor_data(hcursor: u64) -> ResultType<CursorData> {
             // latest snapshot rather than bailing, which would trigger a 10-second
             // MouseCursorService backoff and log spam.
             let mut cd: CursorData = Default::default();
-            cd.id = c.id;
+            cd.id = scale_tagged_cursor_id(c.id);
             // Same logical-canvas downscale as the XFixes path: the hardware
             // cursor buffer is in physical pixels, but the client lays it out in
             // the display's logical canvas, so divide by the display scale.
@@ -473,14 +514,18 @@ pub fn get_cursor_data(hcursor: u64) -> ResultType<CursorData> {
             if !d.is_null() {
                 unsafe {
                     let img = XFixesGetCursorImage(**d);
-                    if !img.is_null() && hcursor == (*img).cursor_serial as u64 {
+                    // hcursor comes from get_cursor(), which tags the id with the
+                    // scale; tag this side too so the match still holds.
+                    if !img.is_null()
+                        && hcursor == scale_tagged_cursor_id((*img).cursor_serial as u64)
+                    {
                         let mut cd: CursorData = Default::default();
                         cd.hotx = (*img).xhot as _;
                         cd.hoty = (*img).yhot as _;
                         cd.width = (*img).width as _;
                         cd.height = (*img).height as _;
                         // to-do: how about if it is 0
-                        cd.id = (*img).cursor_serial as _;
+                        cd.id = scale_tagged_cursor_id((*img).cursor_serial as u64);
                         let pixels =
                             std::slice::from_raw_parts((*img).pixels, (cd.width * cd.height) as _);
                         // cd.colors.resize(pixels.len() * 4, 0);

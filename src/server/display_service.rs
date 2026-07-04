@@ -310,15 +310,20 @@ pub(super) fn check_update_displays(all: &Vec<Display>) {
     let use_logical_scale = !is_x11()
         && crate::is_server()
         && scrap::wayland::display::get_displays().displays.len() > 1;
-    // Set cursor downscale once, from the primary display, so mixed-DPI setups
-    // do not end up with whichever display happened to be last in the list.
-    // Use the same primary-detection as `primary` below — the primary is not
+    // Seed the cursor downscale from the primary display. Reset it to 1.0 when we
+    // are NOT using logical scaling (single monitor, or after a multi->single
+    // transition) so a stale scaled value can't linger and shrink the cursor. The
+    // served-display path (get_capturer_for_display) refines this per display for
+    // mixed-DPI multi-monitor. Primary is detected with get_primary_2 — it is not
     // guaranteed to be all[0] on the PipeWire/Wayland path.
     #[cfg(target_os = "linux")]
-    if use_logical_scale {
-        if let Some(primary) = all.get(get_primary_2(all)) {
-            crate::platform::linux::set_cursor_downscale(primary.scale());
-        }
+    {
+        let downscale = if use_logical_scale {
+            all.get(get_primary_2(all)).map(|p| p.scale()).unwrap_or(1.0)
+        } else {
+            1.0
+        };
+        crate::platform::linux::set_cursor_downscale(downscale);
     }
     let displays = all
         .iter()

@@ -290,6 +290,21 @@ pub(super) fn get_capturer_for_display(
         let cap_display_info: *const CapDisplayInfo = *addr as _;
         unsafe {
             let cap_display_info = &*cap_display_info;
+            // Set the cursor downscale from the display actually being served.
+            // On Wayland get_capturer_monitor() returns through here BEFORE
+            // create_capturer(), so create_capturer's update never runs — this is
+            // the live wiring point. displays[current].scale already carries the
+            // logical-scale gating (1.0 unless multi-monitor logical), so a
+            // mixed-DPI setup uses THIS monitor's scale for the hardware cursor.
+            if let Some(d) = cap_display_info.displays.get(cap_display_info.current) {
+                log::debug!(
+                    "serving display {} '{}' scale {} -> cursor downscale",
+                    cap_display_info.current,
+                    d.name,
+                    d.scale
+                );
+                crate::platform::linux::set_cursor_downscale(d.scale);
+            }
             let rect = cap_display_info.rects[cap_display_info.current];
             Ok(super::video_service::CapturerInfo {
                 origin: rect.0,
