@@ -105,19 +105,30 @@ pub fn capture_available() -> bool {
         _ => {}
     }
     match unsafe { capture_probe() } {
-        ProbeResult::Ok => {
+        (ProbeResult::Ok, _) => {
             PROBE.store(1, Ordering::Relaxed);
             log::info!("DRM/KMS capture probe succeeded");
             true
         }
-        ProbeResult::Permanent => {
+        (ProbeResult::Permanent, errno) => {
             PROBE.store(2, Ordering::Relaxed);
-            log::info!("DRM/KMS capture probe failed (helper unavailable); using PipeWire/portal");
+            // Permanent is only reached from a grab that returned a setup errno,
+            // so `errno` is always Some here; unwrap_or keeps it total.
+            log::info!(
+                "DRM/KMS capture probe failed (helper unavailable, errno {}); using PipeWire/portal",
+                errno.unwrap_or(0)
+            );
             false
         }
-        ProbeResult::Transient => {
-            log::debug!(
-                "DRM/KMS capture probe inconclusive (transient); using PipeWire/portal for now, will re-probe"
+        (ProbeResult::Transient, Some(errno)) => {
+            log::info!(
+                "DRM/KMS capture probe got no usable frame (errno {errno}); using PipeWire/portal for now, will re-probe"
+            );
+            false
+        }
+        (ProbeResult::Transient, None) => {
+            log::info!(
+                "DRM/KMS capture probe could not open a DRM context (no active CRTC yet or helper unavailable); using PipeWire/portal for now, will re-probe"
             );
             false
         }
@@ -197,16 +208,17 @@ fn build_drm_config(crtc_id: u32) -> (Option<std::ffi::CString>, drmtap_config) 
 
 // Open a context on the auto-selected active CRTC (crtc_id 0) and attempt a
 // single grab, tolerating a few transient errors before the first frame.
-unsafe fn capture_probe() -> ProbeResult {
+unsafe fn capture_probe() -> (ProbeResult, Option<i32>) {
     let (_device_cstr, cfg) = build_drm_config(0);
     let ctx = drmtap_open(&cfg);
     if ctx.is_null() {
         // open() can fail because there is no active CRTC yet (DPMS/topology)
         // just as easily as for a real setup problem, so don't cache it — the
         // next enumeration re-probes.
-        return ProbeResult::Transient;
+        return (ProbeResult::Transient, None);
     }
     let mut result = ProbeResult::Transient;
+    let mut errno: Option<i32> = None;
     for _ in 0..8 {
         let mut frame: drmtap_frame_info = std::mem::zeroed();
         let ret = drmtap_grab_mapped(ctx, &mut frame);
@@ -215,6 +227,7 @@ unsafe fn capture_probe() -> ProbeResult {
             result = ProbeResult::Ok;
             break;
         }
+        errno = Some(-ret);
         if is_transient_errno(ret) {
             std::thread::sleep(Duration::from_millis(10));
             continue;
@@ -230,7 +243,7 @@ unsafe fn capture_probe() -> ProbeResult {
         break;
     }
     drmtap_close(ctx);
-    result
+    (result, errno)
 }
 
 pub struct Display {
