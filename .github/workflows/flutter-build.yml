@@ -1679,6 +1679,23 @@ jobs:
                 mv "$name" /workspace/"${name%%.rpm}-suse.rpm"
             done
 
+            # --- opt-in unattended-wayland (DRM/KMS) variant: a separate deb ---
+            # Ships the privileged drmtap-helper so enabling consent-free capture
+            # is an explicit install choice (the package name states what it does).
+            # Built last so the drm relink can't leak into the stock deb/rpm above.
+            # x86_64 only (the unattended/kiosk/server use case); the package
+            # Conflicts/Replaces the stock rustdesk package (install one or other).
+            if [[ "${{ matrix.job.arch }}" == "x86_64" ]]; then
+              pushd /workspace
+              echo -e "start packaging unattended-wayland (DRM) deb"
+              cargo build --locked --lib $JOBS --features hwcodec,flutter,unix-file-copy-paste,drm --release
+              python3 ./build.py --flutter --drm --skip-cargo
+              for name in rustdesk-unattended-wayland*??.deb; do
+                mv "$name" "${name%%.deb}-${{ matrix.job.arch }}.deb"
+              done
+              popd
+            fi
+
       - name: Publish debian/rpm package
         if: env.UPLOAD_ARTIFACT == 'true'
         uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
@@ -1695,6 +1712,13 @@ jobs:
         with:
           name: rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}.deb
           path: rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}.deb
+
+      - name: Upload unattended-wayland deb
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: matrix.job.arch == 'x86_64' && env.UPLOAD_ARTIFACT == 'true'
+        with:
+          name: rustdesk-unattended-wayland-${{ env.VERSION }}-${{ matrix.job.arch }}.deb
+          path: rustdesk-unattended-wayland-${{ env.VERSION }}-${{ matrix.job.arch }}.deb
 
       # only x86_64 for arch since we can not find newest arm64 docker image to build
       # old arch image does not make sense for arch since it is "arch" which always update to date

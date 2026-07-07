@@ -297,22 +297,29 @@ def get_features(args):
     return features
 
 
-def generate_control_file(version, extra_depends=""):
+def generate_control_file(version, extra_depends="", package_name="rustdesk"):
     control_file_path = "../res/DEBIAN/control"
     system2('/bin/rm -rf %s' % control_file_path)
 
-    content = """Package: rustdesk
+    # An alternative-build package (e.g. the opt-in unattended-wayland / DRM
+    # variant) installs the same files as the stock `rustdesk` package, so it
+    # must conflict with / replace it: you install one OR the other, not both.
+    variant_control = ""
+    if package_name != "rustdesk":
+        variant_control = "Conflicts: rustdesk\nReplaces: rustdesk\nProvides: rustdesk\n"
+
+    content = """Package: %s
 Section: net
 Priority: optional
 Version: %s
 Architecture: %s
 Maintainer: rustdesk <info@rustdesk.com>
 Homepage: https://rustdesk.com
-Depends: libgtk-3-0t64 | libgtk-3-0, libxcb-randr0, libxdo3 | libxdo4, libxfixes3, libxcb-shape0, libxcb-xfixes0, libasound2t64 | libasound2, libsystemd0, curl, libva2, libva-drm2, libva-x11-2, libgstreamer-plugins-base1.0-0, libpam0g, gstreamer1.0-pipewire%s%s
+%sDepends: libgtk-3-0t64 | libgtk-3-0, libxcb-randr0, libxdo3 | libxdo4, libxfixes3, libxcb-shape0, libxcb-xfixes0, libasound2t64 | libasound2, libsystemd0, curl, libva2, libva-drm2, libva-x11-2, libgstreamer-plugins-base1.0-0, libpam0g, gstreamer1.0-pipewire%s%s
 Recommends: libayatana-appindicator3-1
 Description: A remote control software.
 
-""" % (version, get_deb_arch(), get_deb_extra_depends(), extra_depends)
+""" % (package_name, version, get_deb_arch(), variant_control, get_deb_extra_depends(), extra_depends)
     file = open(control_file_path, "w")
     file.write(content)
     file.close()
@@ -369,17 +376,22 @@ def build_flutter_deb(version, features):
         system2('mkdir -p tmpdeb/usr/lib/rustdesk')
         system2('cp ../target/release/drmtap-helper tmpdeb/usr/lib/rustdesk/drmtap-helper')
 
+    # A DRM build ships as a separately-named, opt-in package so installing it is
+    # an explicit choice — the package name itself states what it enables. It is
+    # an alternative build of the same app, so generate_control_file marks it
+    # Conflicts/Replaces/Provides rustdesk (install one or the other).
+    package_name = 'rustdesk-unattended-wayland' if ships_helper else 'rustdesk'
     system2('mkdir -p tmpdeb/DEBIAN')
     # postinst runs setcap (from libcap2-bin) on the helper; make it a hard
     # dependency so a DRM package can't install an unusable, cap-less helper.
-    generate_control_file(version, ", libcap2-bin" if ships_helper else "")
+    generate_control_file(version, ", libcap2-bin" if ships_helper else "", package_name)
     system2('cp -a ../res/DEBIAN/* tmpdeb/DEBIAN/')
     md5_file_folder("tmpdeb/")
     system2('dpkg-deb -b tmpdeb rustdesk.deb;')
 
     system2('/bin/rm -rf tmpdeb/')
     system2('/bin/rm -rf ../res/DEBIAN/control')
-    os.rename('rustdesk.deb', '../rustdesk-%s.deb' % version)
+    os.rename('rustdesk.deb', '../%s-%s.deb' % (package_name, version))
     os.chdir("..")
 
 
