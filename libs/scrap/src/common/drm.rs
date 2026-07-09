@@ -46,6 +46,13 @@ pub struct DrmCursor {
 
 static DRM_CURSOR: Mutex<Option<DrmCursor>> = Mutex::new(None);
 
+// Sentinel id published when the cursor plane reports the cursor as hidden
+// (drmtap_get_cursor -> visible == 0). Distinct from any real cursor hash (an
+// FNV-1a over the pixels), so get_cursor() reports a change and the client drops
+// the last shape instead of showing it forever. Collision with a real hash is
+// ~1/2^64.
+const HIDDEN_CURSOR_ID: u64 = u64::MAX;
+
 /// Current hardware cursor captured from the DRM cursor plane, if any.
 pub fn drm_cursor() -> Option<DrmCursor> {
     DRM_CURSOR.lock().unwrap().clone()
@@ -80,8 +87,13 @@ fn is_setup_errno(ret: i32) -> bool {
 
 enum ProbeResult {
     Ok,
+    // Helper ran but the probed CRTC (crtc 0) could not be grabbed for a
+    // CRTC-specific reason (unsupported scanout format, or asleep/gone). DRM is
+    // still viable, so let Display::all() enumerate and drop just that connector
+    // instead of sinking every display to PipeWire.
+    Available,
     Permanent,  // helper cannot run / not set up (denied, missing) — cache it
-    Transient,  // busy, no-frame-yet, or topology (CRTC asleep) — retry later
+    Transient,  // busy, no-frame-yet, or could not open a context — retry later
 }
 
 // Whether DRM/KMS capture actually works on this host, i.e. the privileged
@@ -108,6 +120,17 @@ pub fn capture_available() -> bool {
         (ProbeResult::Ok, _) => {
             PROBE.store(1, Ordering::Relaxed);
             log::info!("DRM/KMS capture probe succeeded");
+            true
+        }
+        (ProbeResult::Available, errno) => {
+            // The helper works; only the probed CRTC could not be grabbed. Cache
+            // available and let Display::all() enumerate and drop the bad CRTC, so
+            // a multi-monitor host keeps DRM for the displays that do work.
+            PROBE.store(1, Ordering::Relaxed);
+            log::info!(
+                "DRM/KMS helper works but the probed CRTC could not be grabbed (errno {}); enumerating displays",
+                errno.unwrap_or(0)
+            );
             true
         }
         (ProbeResult::Permanent, errno) => {
@@ -232,13 +255,15 @@ unsafe fn capture_probe() -> (ProbeResult, Option<i32>) {
             std::thread::sleep(Duration::from_millis(10));
             continue;
         }
-        // Non-transient: cache only a genuine helper/setup failure; leave a
-        // topology failure (ENODEV = CRTC asleep/gone) retryable so a display
-        // that is merely asleep at startup doesn't disable DRM for good.
+        // Non-transient. A genuine helper/setup failure (denied, missing) is
+        // global, so cache it as Permanent. Anything else means the helper ran
+        // but this one CRTC could not be grabbed (unsupported format, or ENODEV =
+        // asleep/gone): keep DRM available and let Display::all() enumerate and
+        // drop just this connector, rather than gating every display on crtc 0.
         result = if is_setup_errno(ret) {
             ProbeResult::Permanent
         } else {
-            ProbeResult::Transient
+            ProbeResult::Available
         };
         break;
     }
@@ -648,7 +673,23 @@ impl Capturer {
     unsafe fn update_cursor(&mut self) {
         let mut c: drmtap_cursor_info = std::mem::zeroed();
         let cret = drmtap_get_cursor(self.ctx, &mut c);
-        if cret == 0
+        if cret == 0 && c.visible == 0 {
+            // Cursor hidden (e.g. a fullscreen app grabbed the pointer): publish a
+            // distinct empty cursor so get_cursor()'s id changes and the client
+            // hides the pointer, instead of keeping the last visible shape on
+            // screen until some new cursor shape happens to be captured.
+            let mut lock = DRM_CURSOR.lock().unwrap();
+            if lock.as_ref().map_or(true, |old| old.id != HIDDEN_CURSOR_ID) {
+                *lock = Some(DrmCursor {
+                    id: HIDDEN_CURSOR_ID,
+                    width: 1,
+                    height: 1,
+                    hotx: 0,
+                    hoty: 0,
+                    colors: vec![0, 0, 0, 0],
+                });
+            }
+        } else if cret == 0
             && c.visible != 0
             && !c.pixels.is_null()
             && c.width > 0
@@ -719,5 +760,49 @@ impl Drop for Capturer {
             unsafe { drmtap_close(self.ctx); }
             self.ctx = std::ptr::null_mut();
         }
+    }
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::*;
+
+    // These exercise the process-global BAD_CRTCS / LAST_TOPOLOGY, so they live in
+    // one test to stay sequential and race-free without a serial-test harness.
+    #[test]
+    fn errno_classification_and_per_crtc_fallback() {
+        // A setup errno means the helper cannot run at all -> global (Permanent),
+        // so DRM is disabled for the whole session.
+        for e in [libc::EACCES, libc::EPERM, libc::ENOENT] {
+            assert!(is_setup_errno(-e), "errno {e} must gate DRM globally");
+        }
+        // Anything else is per-CRTC / topology: the probe returns Available so
+        // Display::all() drops just the bad connector instead of sinking DRM for
+        // every display (the codex round-1 fix).
+        for e in [libc::ENOTSUP, libc::ENODEV, libc::EINVAL, libc::EIO] {
+            assert!(!is_setup_errno(-e), "errno {e} must not gate DRM globally");
+        }
+
+        BAD_CRTCS.lock().unwrap().clear();
+        LAST_TOPOLOGY.lock().unwrap().clear();
+        let topo = [("HDMI-A-1".to_string(), 150u32), ("DP-1".to_string(), 386u32)];
+        reset_bad_crtcs_on_topology_change(&topo); // establish the baseline
+        assert!(!is_bad_crtc("DP-1", 386));
+        mark_bad_crtc("DP-1", 386);
+        assert!(is_bad_crtc("DP-1", 386));
+        assert!(!is_bad_crtc("HDMI-A-1", 150), "other CRTCs stay usable");
+
+        // A bare reorder of the same connectors is NOT a topology change: a
+        // just-failed CRTC must not silently come back.
+        let reordered = [("DP-1".to_string(), 386u32), ("HDMI-A-1".to_string(), 150u32)];
+        reset_bad_crtcs_on_topology_change(&reordered);
+        assert!(is_bad_crtc("DP-1", 386), "a reorder must keep the bad set");
+
+        // A real change (a connector gone) clears the set so everything re-tests.
+        reset_bad_crtcs_on_topology_change(&[("HDMI-A-1".to_string(), 150u32)]);
+        assert!(!is_bad_crtc("DP-1", 386), "a topology change must clear the bad set");
+
+        BAD_CRTCS.lock().unwrap().clear();
+        LAST_TOPOLOGY.lock().unwrap().clear();
     }
 }

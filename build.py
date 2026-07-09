@@ -331,6 +331,27 @@ def ffi_bindgen_function_refactor():
         'sed -i "s/ffi.NativeFunction<ffi.Bool Function(DartPort/ffi.NativeFunction<ffi.Uint8 Function(DartPort/g" flutter/lib/generated_bridge.dart')
 
 
+def append_drm_helper_postinst():
+    # Append the helper group + setcap setup to the DRM package's postinst. Only
+    # the DRM package calls this, so the stock package's DEBIAN/postinst stays
+    # byte-identical to upstream. cap_sys_admin is granted but kept out of
+    # world-exec (a world-exec cap_sys_admin binary lets any local user read the
+    # active scanout, incl. the login/lock screen), so it is restricted to a
+    # dedicated group before setcap runs.
+    with open('tmpdeb/DEBIAN/postinst', 'a') as f:
+        f.write(
+            '\n'
+            'if [ "$1" = configure ] && [ -f /usr/lib/rustdesk/drmtap-helper ]; then\n'
+            '\tgroupadd -f -r rustdesk-capture 2>/dev/null || addgroup --system rustdesk-capture 2>/dev/null || true\n'
+            '\tchown root:rustdesk-capture /usr/lib/rustdesk/drmtap-helper 2>/dev/null || true\n'
+            '\tchmod 0750 /usr/lib/rustdesk/drmtap-helper\n'
+            '\tif command -v setcap >/dev/null; then\n'
+            '\t\tsetcap cap_sys_admin+ep /usr/lib/rustdesk/drmtap-helper || echo "rustdesk: warning: setcap on drmtap-helper failed; DRM/KMS capture will fall back to PipeWire" >&2\n'
+            '\tfi\n'
+            'fi\n'
+        )
+
+
 def build_flutter_deb(version, features):
     if not skip_cargo:
         system2(f'cargo build --locked --features {features} --lib --release')
@@ -387,25 +408,7 @@ def build_flutter_deb(version, features):
     generate_control_file(version, ", libcap2-bin" if ships_helper else "", package_name)
     system2('cp -a ../res/DEBIAN/* tmpdeb/DEBIAN/')
     if ships_helper:
-        # Append the helper group + setcap setup to the postinst ONLY for the DRM
-        # package, so the stock package's DEBIAN/postinst stays byte-identical to
-        # upstream (the drm feature must not touch shared config when it is off).
-        with open('tmpdeb/DEBIAN/postinst', 'a') as f:
-            f.write(
-                '\n'
-                'if [ "$1" = configure ] && [ -f /usr/lib/rustdesk/drmtap-helper ]; then\n'
-                '\t# DRM/KMS capture helper: grant cap_sys_admin but keep it out of\n'
-                '\t# world-exec (a world-exec cap_sys_admin binary lets any local user\n'
-                '\t# read the active scanout, incl. the login/lock screen). Restrict it\n'
-                '\t# to a dedicated group first, then setcap; only rustdesk-capture runs it.\n'
-                '\tgroupadd -f -r rustdesk-capture 2>/dev/null || addgroup --system rustdesk-capture 2>/dev/null || true\n'
-                '\tchown root:rustdesk-capture /usr/lib/rustdesk/drmtap-helper 2>/dev/null || true\n'
-                '\tchmod 0750 /usr/lib/rustdesk/drmtap-helper\n'
-                '\tif command -v setcap >/dev/null; then\n'
-                '\t\tsetcap cap_sys_admin+ep /usr/lib/rustdesk/drmtap-helper || echo "rustdesk: warning: setcap on drmtap-helper failed; DRM/KMS capture will fall back to PipeWire" >&2\n'
-                '\tfi\n'
-                'fi\n'
-            )
+        append_drm_helper_postinst()
     md5_file_folder("tmpdeb/")
     system2('dpkg-deb -b tmpdeb rustdesk.deb;')
 
@@ -453,8 +456,15 @@ def build_deb_from_folder(version, binary_folder):
     # Only a bundle staged with the DRM helper needs libcap2-bin (postinst runs
     # setcap on it); detect it in the payload so plain bundles stay unaffected.
     ships_helper = os.path.exists('tmpdeb/usr/lib/rustdesk/drmtap-helper')
-    generate_control_file(version, ", libcap2-bin" if ships_helper else "")
+    # A staged bundle carrying the helper is the DRM package: name it accordingly
+    # (Conflicts/Replaces/Provides rustdesk) and run the same helper setcap/group
+    # setup as build_flutter_deb, so a --package DRM bundle is not left with an
+    # unusable, cap-less helper under the stock package name.
+    package_name = 'rustdesk-unattended-wayland' if ships_helper else 'rustdesk'
+    generate_control_file(version, ", libcap2-bin" if ships_helper else "", package_name)
     system2('cp -a ../res/DEBIAN/* tmpdeb/DEBIAN/')
+    if ships_helper:
+        append_drm_helper_postinst()
     md5_file_folder("tmpdeb/")
     system2('dpkg-deb -b tmpdeb rustdesk.deb;')
 
