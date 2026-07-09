@@ -131,6 +131,12 @@ def make_parser():
         help='Build with unix file copy paste feature'
     )
     parser.add_argument(
+        '--drm',
+        action='store_true',
+        help='Linux only: build the DRM/KMS capture backend (ships the privileged '
+             'drmtap-helper, installed 0750 root:rustdesk-capture). Off by default.'
+    )
+    parser.add_argument(
         '--skip-cargo',
         action='store_true',
         help='Skip cargo build process, only flutter version + Linux supported currently'
@@ -282,6 +288,8 @@ def get_features(args):
         features.append('flutter')
     if args.unix_file_copy_paste:
         features.append('unix-file-copy-paste')
+    if not windows and not osx and args.drm:
+        features.append('drm')
     if osx:
         if args.screencapturekit:
             features.append('screencapturekit')
@@ -289,22 +297,29 @@ def get_features(args):
     return features
 
 
-def generate_control_file(version):
+def generate_control_file(version, extra_depends="", package_name="rustdesk"):
     control_file_path = "../res/DEBIAN/control"
     system2('/bin/rm -rf %s' % control_file_path)
 
-    content = """Package: rustdesk
+    # An alternative-build package (e.g. the opt-in unattended-wayland / DRM
+    # variant) installs the same files as the stock `rustdesk` package, so it
+    # must conflict with / replace it: you install one OR the other, not both.
+    variant_control = ""
+    if package_name != "rustdesk":
+        variant_control = "Conflicts: rustdesk\nReplaces: rustdesk\nProvides: rustdesk\n"
+
+    content = """Package: %s
 Section: net
 Priority: optional
 Version: %s
 Architecture: %s
 Maintainer: rustdesk <info@rustdesk.com>
 Homepage: https://rustdesk.com
-Depends: libgtk-3-0t64 | libgtk-3-0, libxcb-randr0, libxdo3 | libxdo4, libxfixes3, libxcb-shape0, libxcb-xfixes0, libasound2t64 | libasound2, libsystemd0, curl, libva2, libva-drm2, libva-x11-2, libgstreamer-plugins-base1.0-0, libpam0g, gstreamer1.0-pipewire%s
+%sDepends: libgtk-3-0t64 | libgtk-3-0, libxcb-randr0, libxdo3 | libxdo4, libxfixes3, libxcb-shape0, libxcb-xfixes0, libasound2t64 | libasound2, libsystemd0, curl, libva2, libva-drm2, libva-x11-2, libgstreamer-plugins-base1.0-0, libpam0g, gstreamer1.0-pipewire%s%s
 Recommends: libayatana-appindicator3-1
 Description: A remote control software.
 
-""" % (version, get_deb_arch(), get_deb_extra_depends())
+""" % (package_name, version, get_deb_arch(), variant_control, get_deb_extra_depends(), extra_depends)
     file = open(control_file_path, "w")
     file.write(content)
     file.close()
@@ -352,16 +367,51 @@ def build_flutter_deb(version, features):
         'cp ../res/pam.d/rustdesk.debian tmpdeb/etc/pam.d/rustdesk')
     system2(
         "echo \"#!/bin/sh\" >> tmpdeb/usr/share/rustdesk/files/polkit && chmod a+x tmpdeb/usr/share/rustdesk/files/polkit")
+    # Install drmtap-helper for the privileged DRM/KMS capture path — but ONLY
+    # when this build actually enabled the `drm` feature. Gating on the feature
+    # (not on whether a stale ../target/release/drmtap-helper happens to exist
+    # from an earlier --drm build) keeps the opt-in guarantee for normal packages.
+    ships_helper = 'drm' in features
+    if ships_helper:
+        system2('mkdir -p tmpdeb/usr/lib/rustdesk')
+        system2('cp ../target/release/drmtap-helper tmpdeb/usr/lib/rustdesk/drmtap-helper')
 
+    # A DRM build ships as a separately-named, opt-in package so installing it is
+    # an explicit choice; the package name itself states what it enables. It is
+    # an alternative build of the same app, so generate_control_file marks it
+    # Conflicts/Replaces/Provides rustdesk (install one or the other).
+    package_name = 'rustdesk-unattended-wayland' if ships_helper else 'rustdesk'
     system2('mkdir -p tmpdeb/DEBIAN')
-    generate_control_file(version)
+    # postinst runs setcap (from libcap2-bin) on the helper; make it a hard
+    # dependency so a DRM package can't install an unusable, cap-less helper.
+    generate_control_file(version, ", libcap2-bin" if ships_helper else "", package_name)
     system2('cp -a ../res/DEBIAN/* tmpdeb/DEBIAN/')
+    if ships_helper:
+        # Append the helper group + setcap setup to the postinst ONLY for the DRM
+        # package, so the stock package's DEBIAN/postinst stays byte-identical to
+        # upstream (the drm feature must not touch shared config when it is off).
+        with open('tmpdeb/DEBIAN/postinst', 'a') as f:
+            f.write(
+                '\n'
+                'if [ "$1" = configure ] && [ -f /usr/lib/rustdesk/drmtap-helper ]; then\n'
+                '\t# DRM/KMS capture helper: grant cap_sys_admin but keep it out of\n'
+                '\t# world-exec (a world-exec cap_sys_admin binary lets any local user\n'
+                '\t# read the active scanout, incl. the login/lock screen). Restrict it\n'
+                '\t# to a dedicated group first, then setcap; only rustdesk-capture runs it.\n'
+                '\tgroupadd -f -r rustdesk-capture 2>/dev/null || addgroup --system rustdesk-capture 2>/dev/null || true\n'
+                '\tchown root:rustdesk-capture /usr/lib/rustdesk/drmtap-helper 2>/dev/null || true\n'
+                '\tchmod 0750 /usr/lib/rustdesk/drmtap-helper\n'
+                '\tif command -v setcap >/dev/null; then\n'
+                '\t\tsetcap cap_sys_admin+ep /usr/lib/rustdesk/drmtap-helper || echo "rustdesk: warning: setcap on drmtap-helper failed; DRM/KMS capture will fall back to PipeWire" >&2\n'
+                '\tfi\n'
+                'fi\n'
+            )
     md5_file_folder("tmpdeb/")
     system2('dpkg-deb -b tmpdeb rustdesk.deb;')
 
     system2('/bin/rm -rf tmpdeb/')
     system2('/bin/rm -rf ../res/DEBIAN/control')
-    os.rename('rustdesk.deb', '../rustdesk-%s.deb' % version)
+    os.rename('rustdesk.deb', '../%s-%s.deb' % (package_name, version))
     os.chdir("..")
 
 
@@ -389,9 +439,21 @@ def build_deb_from_folder(version, binary_folder):
         'cp ../res/rustdesk-link.desktop tmpdeb/usr/share/applications/rustdesk-link.desktop')
     system2(
         "echo \"#!/bin/sh\" >> tmpdeb/usr/share/rustdesk/files/polkit && chmod a+x tmpdeb/usr/share/rustdesk/files/polkit")
+    # Install drmtap-helper for the DRM/KMS capture path from the STAGED payload
+    # (binary_folder), not from ../target/release — that tree may be unrelated or
+    # stale for a prebuilt / cross-arch bundle. The helper is only in the payload
+    # when the bundle was built with the `drm` feature, so this stays opt-in. The
+    # `cp -r` above already placed any bundled drmtap-helper under
+    # usr/share/rustdesk/; move it to usr/lib/rustdesk/ where postinst applies the
+    # 0750 + capability.
+    system2('mkdir -p tmpdeb/usr/lib/rustdesk')
+    system2('if [ -f tmpdeb/usr/share/rustdesk/drmtap-helper ]; then mv tmpdeb/usr/share/rustdesk/drmtap-helper tmpdeb/usr/lib/rustdesk/drmtap-helper; fi')
 
     system2('mkdir -p tmpdeb/DEBIAN')
-    generate_control_file(version)
+    # Only a bundle staged with the DRM helper needs libcap2-bin (postinst runs
+    # setcap on it); detect it in the payload so plain bundles stay unaffected.
+    ships_helper = os.path.exists('tmpdeb/usr/lib/rustdesk/drmtap-helper')
+    generate_control_file(version, ", libcap2-bin" if ships_helper else "")
     system2('cp -a ../res/DEBIAN/* tmpdeb/DEBIAN/')
     md5_file_folder("tmpdeb/")
     system2('dpkg-deb -b tmpdeb rustdesk.deb;')
