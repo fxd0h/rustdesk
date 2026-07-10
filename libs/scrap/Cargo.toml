@@ -11,6 +11,7 @@ edition = "2018"
 
 [features]
 wayland = ["gstreamer", "gstreamer-app", "gstreamer-video", "dbus", "tracing", "zbus"]
+drm = ["dep:libdrmtap-sys"]
 mediacodec = ["ndk"]
 linux-pkg-config = ["dep:pkg-config"]
 hwcodec = ["dep:hwcodec"]
@@ -52,6 +53,11 @@ bindgen = "0.65"
 pkg-config = { version = "0.3.27", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+# DRM/KMS capture bindings (statically embeds the libdrmtap C sources).
+# Enabled via the `drm` feature; not required for PipeWire/X11-only builds.
+# Built from the rustdesk-org fork of libdrmtap (not crates.io), pinned by rev:
+# the helper is a privileged TCB component, so a bump must be explicit.
+libdrmtap-sys = { git = "https://github.com/rustdesk-org/libdrmtap", rev = "df530502e69183de0b6aba36403ef811eff3a4ef", optional = true }
 dbus = { version = "0.9", optional = true }
 tracing = { version = "0.1", optional = true }
 gstreamer = { version = "0.16", optional = true }
