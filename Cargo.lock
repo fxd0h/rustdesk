@@ -4468,8 +4468,7 @@ dependencies = [
 [[package]]
 name = "libdrmtap-sys"
 version = "0.4.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2b11669c93786775711332ff36a5784b3e7be1eda96e51acb3c47cb47f720be0"
+source = "git+https://github.com/rustdesk-org/libdrmtap?rev=df530502e69183de0b6aba36403ef811eff3a4ef#df530502e69183de0b6aba36403ef811eff3a4ef"
 dependencies = [
  "cc",
  "pkg-config",
