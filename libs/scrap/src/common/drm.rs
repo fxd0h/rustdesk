@@ -631,6 +631,26 @@ impl TraitCapturer for Capturer {
             let w = frame.width as usize;
             let h = frame.height as usize;
             let stride = frame.stride as usize;
+            // The per-row copy below reads w*4 bytes/row, but the mapped source is
+            // only stride*height bytes and the helper does not validate width
+            // against stride. A scanout that is not 32-bit (RGB565/C8, or a YUV
+            // overlay plane, common on BMC/headless GPUs) has stride < w*4, so the
+            // copy would read past the buffer and leak process memory into the
+            // frame sent to the peer. Require 4 bytes per pixel per row and a sane
+            // geometry (also caps w*4*h so it cannot overflow); otherwise drop DRM
+            // for this host and let the dispatcher fall back to PipeWire/portal.
+            if w > 16384 || h > 16384 || stride < w * 4 {
+                log::warn!(
+                    "DRM scanout is not a 32-bit BGRA-compatible format ({w}x{h} stride {stride} fourcc {:#010x}); falling back to PipeWire/portal",
+                    frame.format
+                );
+                drmtap_frame_release(self.ctx, &mut frame);
+                PROBE.store(2, Ordering::Relaxed);
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "unsupported DRM scanout format",
+                ));
+            }
             let frame_size = w * 4 * h;
 
             if self.buffer.len() != frame_size {
