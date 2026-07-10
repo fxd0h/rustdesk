@@ -9,7 +9,10 @@
 // hardcoded pattern) or an explicit path that we realpath-gate to /dev/dri/
 // before opening. The DRM_DEVICE env is intentionally NOT consulted here.
 
-use super::drmtap_dl::{self, drmtap_config, drmtap_ctx, drmtap_frame_info, DrmtapLib};
+use super::drmtap_dl::{
+    self, drmtap_config, drmtap_ctx, drmtap_cursor_info, drmtap_display, drmtap_frame_info,
+    DrmtapLib,
+};
 use hbb_common::log;
 use std::ffi::CString;
 use std::io;
@@ -17,6 +20,32 @@ use std::io;
 // Largest scanout we will copy; also bounds w*4*h against overflow. 16384 covers
 // 8K+ with headroom; anything larger is rejected as a bogus/hostile geometry.
 const MAX_DIM: u32 = 16384;
+
+/// Sentinel cursor id published when the plane reports the cursor hidden, so the
+/// id changes and the client drops the last shape. Distinct from any real hash.
+pub const HIDDEN_CURSOR_ID: u64 = u64::MAX;
+
+/// A hardware-cursor snapshot to ship to the server (RGBA colors).
+pub struct CursorSnapshot {
+    pub id: u64,
+    pub width: u32,
+    pub height: u32,
+    pub hotx: i32,
+    pub hoty: i32,
+    pub colors: Vec<u8>,
+}
+
+/// One enumerated DRM display (physical geometry only; the server augments with
+/// the Wayland logical geometry/scale, which needs the user session).
+pub struct DisplaySnapshot {
+    pub name: String,
+    pub crtc_id: u32,
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+    pub active: bool,
+}
 
 /// Returns true only if `path` canonicalizes to a node directly under /dev/dri/.
 /// This is the realpath gate the libdrmtap helper applied but the in-process
@@ -133,6 +162,122 @@ impl DrmReader {
             }
             (self.lib.frame_release)(self.ctx, &mut frame);
             Ok((&self.buf, w, h))
+        }
+    }
+
+    /// Read the hardware cursor plane. Returns a hidden sentinel when the plane
+    /// reports the cursor invisible, the real shape when visible, or None on a
+    /// read error / unsupported cursor. Ported from the old drm.rs update_cursor.
+    pub fn cursor(&mut self) -> Option<CursorSnapshot> {
+        // SAFETY: ctx valid; c zeroed before the call; released only on success.
+        unsafe {
+            let mut c: drmtap_cursor_info = std::mem::zeroed();
+            let cret = (self.lib.get_cursor)(self.ctx, &mut c);
+            if cret != 0 {
+                return None;
+            }
+            let out = if c.visible == 0 {
+                Some(CursorSnapshot {
+                    id: HIDDEN_CURSOR_ID,
+                    width: 1,
+                    height: 1,
+                    hotx: 0,
+                    hoty: 0,
+                    colors: vec![0, 0, 0, 0],
+                })
+            } else if !c.pixels.is_null()
+                && c.width > 0
+                && c.height > 0
+                && (c.width as i64) * (c.height as i64) <= 256 * 256
+            {
+                let cw = c.width as i32;
+                let ch = c.height as i32;
+                let n = (cw * ch) as usize;
+                let src = std::slice::from_raw_parts(c.pixels, n);
+                let mut hash: u64 = 1469598103934665603;
+                let mut colors = Vec::with_capacity(n * 4);
+                let (mut minx, mut miny, mut maxx, mut maxy) = (cw, ch, -1i32, -1i32);
+                for (i, &p) in src.iter().enumerate() {
+                    let a = ((p >> 24) & 0xff) as u8;
+                    let r = ((p >> 16) & 0xff) as u8;
+                    let g = ((p >> 8) & 0xff) as u8;
+                    let b = (p & 0xff) as u8;
+                    colors.push(r);
+                    colors.push(g);
+                    colors.push(b);
+                    colors.push(a);
+                    hash ^= p as u64;
+                    hash = hash.wrapping_mul(1099511628211);
+                    if a >= 128 {
+                        let x = (i as i32) % cw;
+                        let y = (i as i32) / cw;
+                        if x < minx { minx = x; }
+                        if x > maxx { maxx = x; }
+                        if y < miny { miny = y; }
+                        if y > maxy { maxy = y; }
+                    }
+                }
+                let (hotx, hoty) = if c.hot_x != 0 || c.hot_y != 0 {
+                    (c.hot_x, c.hot_y)
+                } else if maxx >= minx && maxy >= miny {
+                    let (bw, bh) = (maxx - minx + 1, maxy - miny + 1);
+                    if bh > bw * 2 {
+                        ((minx + maxx) / 2, (miny + maxy) / 2)
+                    } else {
+                        (minx, miny)
+                    }
+                } else {
+                    (0, 0)
+                };
+                Some(CursorSnapshot {
+                    id: hash,
+                    width: cw as u32,
+                    height: ch as u32,
+                    hotx,
+                    hoty,
+                    colors,
+                })
+            } else {
+                None
+            };
+            (self.lib.cursor_release)(self.ctx, &mut c);
+            out
+        }
+    }
+
+    /// Enumerate the connected DRM displays (physical geometry). The buffer holds
+    /// up to 16 connectors (the old path truncated at 8); the raw list is shipped
+    /// to the server, which does primary selection + Wayland logical geometry.
+    pub fn displays(&mut self) -> Vec<DisplaySnapshot> {
+        // SAFETY: ctx valid; raw is a zeroed, correctly-sized array; count is
+        // clamped to the buffer before indexing.
+        unsafe {
+            let mut raw = vec![std::mem::zeroed::<drmtap_display>(); 16];
+            let cap = raw.len() as i32;
+            let n = (self.lib.list_displays)(self.ctx, raw.as_mut_ptr(), cap);
+            if n <= 0 {
+                return Vec::new();
+            }
+            let count = (n as usize).min(raw.len());
+            (0..count)
+                .map(|i| {
+                    let name_bytes: Vec<u8> = raw[i]
+                        .name
+                        .iter()
+                        .take_while(|&&ch| ch != 0)
+                        .map(|&ch| ch as u8)
+                        .collect();
+                    DisplaySnapshot {
+                        name: String::from_utf8_lossy(&name_bytes).to_string(),
+                        crtc_id: raw[i].crtc_id,
+                        x: raw[i].x as i32,
+                        y: raw[i].y as i32,
+                        width: raw[i].width,
+                        height: raw[i].height,
+                        active: raw[i].active != 0,
+                    }
+                })
+                .collect()
         }
     }
 }
