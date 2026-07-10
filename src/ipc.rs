@@ -477,6 +477,47 @@ pub enum Data {
     ControlPermissionsRemoteModify(Option<bool>),
     #[cfg(target_os = "windows")]
     FileTransferEnabledState(Option<bool>),
+    // --- DRM/KMS capture (opt-in `drm` feature) over the `_drm` service-scoped channel ---
+    // All of the following are `cfg(all(linux, drm))`, so the drm-off IPC wire is byte-identical
+    // to upstream. Protocol on `_drm`: on connect the root service sends `DrmDisplayList`, the
+    // client replies `DrmStart{display}`, then the service streams `DrmFrame` + send_raw(BGRA) and
+    // `DrmCursor` + send_raw(RGBA). A frame/cursor header is ALWAYS immediately followed by exactly
+    // one `send_raw()` payload (the same header-then-raw pairing as `FileBlockFromCM`). This keeps
+    // the header extensible: a future zero-copy `DrmFrameDmabuf { fd, stride, modifier, .. }` slots
+    // in as a sibling variant without changing the transport.
+    /// Client -> service: begin streaming the chosen display.
+    #[cfg(all(target_os = "linux", feature = "drm"))]
+    DrmStart { display: i32 },
+    /// Service -> client: the enumerated DRM displays (sent once, before frames).
+    #[cfg(all(target_os = "linux", feature = "drm"))]
+    DrmDisplayList(Vec<DrmDisplayInfo>),
+    /// Service -> client: a frame header; the packed BGRA pixels follow via `send_raw()`.
+    #[cfg(all(target_os = "linux", feature = "drm"))]
+    DrmFrame { width: u32, height: u32 },
+    /// Service -> client: a hardware-cursor header; the RGBA pixels follow via `send_raw()`.
+    #[cfg(all(target_os = "linux", feature = "drm"))]
+    DrmCursor {
+        id: u64,
+        width: u32,
+        height: u32,
+        hotx: i32,
+        hoty: i32,
+    },
+}
+
+/// One enumerated DRM display shipped over `_drm` (physical geometry). The serializable IPC
+/// form of `scrap::drm_reader::DisplaySnapshot`; the server augments it with the Wayland
+/// logical geometry/scale, which needs the user session.
+#[cfg(all(target_os = "linux", feature = "drm"))]
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct DrmDisplayInfo {
+    pub name: String,
+    pub crtc_id: u32,
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+    pub active: bool,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -1418,6 +1459,168 @@ pub async fn start_pa() {
         Err(err) => {
             log::error!("Failed to start pa ipc server: {}", err);
         }
+    }
+}
+
+/// Filesystem path of the `_drm` capture socket. It lives beside the hardened `_service` socket in
+/// the shared `/tmp/<app>-service` directory (cross-uid, traversable) so the root `--service` and
+/// the user `--server` share one uid-independent path. Derived from the real `_service` path so we
+/// inherit hbb_common's directory convention WITHOUT teaching hbb_common about a drm-specific
+/// postfix (keeps the isolation clean: no shared-lib change). Both ends call this.
+#[cfg(all(target_os = "linux", feature = "drm"))]
+pub(crate) fn drm_ipc_path() -> String {
+    let service_path = Config::ipc_path("_service");
+    let dir = std::path::Path::new(&service_path)
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("/tmp"));
+    dir.join("ipc_drm").to_string_lossy().into_owned()
+}
+
+/// Bind the `_drm` listener. Unlike `new_listener`, this does not route through hbb_common's
+/// service-postfix machinery — it places the socket in the shared service dir directly, so the
+/// drm-off build needs no hbb_common change. The socket is 0666 (world-connectable) so the
+/// unprivileged `--server` can reach it; every accepted peer is still authorized in
+/// `handle_drm_conn` (root or the active session uid + exe identity), so connectable != authorized.
+#[cfg(all(target_os = "linux", feature = "drm"))]
+async fn new_drm_listener() -> ResultType<Incoming> {
+    let path = drm_ipc_path();
+    // Ensure the shared service dir exists at its hardened (0711) mode. Passing the `_service`
+    // postfix reuses hbb_common's expected mode for that directory; it only creates/chmods the
+    // directory (no pid/socket side effects) and is idempotent with the real `_service` listener.
+    let _ = ensure_secure_ipc_parent_dir(&path, "_service")?;
+    // Clear any stale socket from a previous run before binding.
+    std::fs::remove_file(&path).ok();
+    let mut endpoint = Endpoint::new(path.clone());
+    endpoint.set_security_attributes(SecurityAttributes::allow_everyone_create()?);
+    let incoming = endpoint.incoming()?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).map_err(|err| {
+        std::fs::remove_file(&path).ok();
+        err
+    })?;
+    log::info!("Started drm ipc server at path: {}", &path);
+    Ok(incoming)
+}
+
+/// DRM/KMS capture producer. Runs in the ROOT `--service` (which holds CAP_SYS_ADMIN, so
+/// libdrmtap reads the scanout in-process — no helper, no setcap). Mirrors `start_pa`: its own
+/// dedicated `current_thread` runtime/thread, one consumer connection at a time. This matters
+/// because `DrmReader` is `!Send` and `grab()` is a BLOCKING C call, so it must NOT be moved into
+/// a multi-thread `tokio::spawn`; keeping it inline on this dedicated runtime is correct (a
+/// blocking grab just parks this thread, exactly like `start_pa`'s blocking `s.read`).
+#[cfg(all(target_os = "linux", feature = "drm"))]
+#[tokio::main(flavor = "current_thread")]
+pub async fn start_drm() {
+    match new_drm_listener().await {
+        Ok(mut incoming) => loop {
+            if let Some(result) = incoming.next().await {
+                match result {
+                    Ok(stream) => {
+                        if let Err(err) = handle_drm_conn(Connection::new(stream)).await {
+                            log::info!("drm ipc connection ended: {}", err);
+                        }
+                    }
+                    Err(err) => log::error!("Couldn't get drm client: {:?}", err),
+                }
+            }
+        },
+        Err(err) => {
+            log::error!("Failed to start drm ipc server: {}", err);
+        }
+    }
+}
+
+/// Handle one `_drm` consumer: enumerate displays, wait for the client's `DrmStart`, then stream
+/// frames and cursor changes until the client disconnects or the device errors out. On any hard
+/// error we return so the client can fall back to PipeWire/portal.
+#[cfg(all(target_os = "linux", feature = "drm"))]
+async fn handle_drm_conn(mut stream: Connection) -> ResultType<()> {
+    use hbb_common::tokio::time::{sleep, Duration};
+    // ~30 fps producer ceiling; the encoder/QoS on the consumer sets the effective rate. Also
+    // prevents a busy-spin when `grab()` returns the same scanout repeatedly.
+    const FRAME_INTERVAL: Duration = Duration::from_millis(33);
+
+    // The `_drm` socket is world-connectable (0666) so the unprivileged `--server` can reach it,
+    // so we MUST authorize the peer here — this is a dedicated listener that does not go through
+    // the generic `start()` accept loop where service-scoped channels are checked. Same policy as
+    // `_service`: peer must be root or the active session uid, with a `/proc/pid/exe` identity
+    // match. Without this any local process could connect and receive the screen contents.
+    if !authorize_service_scoped_ipc_connection(&stream, "_drm") {
+        log::warn!("drm: rejected unauthorized connection to _drm");
+        return Ok(());
+    }
+
+    let mut reader = match scrap::drm_reader::DrmReader::open(None) {
+        Some(r) => r,
+        None => {
+            log::info!("drm: reader unavailable; closing _drm connection (client will fall back)");
+            return Ok(());
+        }
+    };
+
+    // Ship the display list first so the client can pick + size its capturer.
+    let displays = reader
+        .displays()
+        .into_iter()
+        .map(|d| DrmDisplayInfo {
+            name: d.name,
+            crtc_id: d.crtc_id,
+            x: d.x,
+            y: d.y,
+            width: d.width,
+            height: d.height,
+            active: d.active,
+        })
+        .collect::<Vec<_>>();
+    stream.send(&Data::DrmDisplayList(displays)).await?;
+
+    // Wait for the client to choose a display before streaming.
+    let _display = loop {
+        match stream.next_timeout(10_000).await? {
+            Some(Data::DrmStart { display }) => break display,
+            Some(_) => continue,
+            None => return Ok(()),
+        }
+    };
+    // TODO(P6 multi-monitor): map `_display` to a crtc and target it; the primary scanout is
+    // streamed for now.
+
+    let mut last_cursor_id: u64 = 0;
+    loop {
+        match reader.grab() {
+            Ok((buf, w, h)) => {
+                stream
+                    .send(&Data::DrmFrame {
+                        width: w as u32,
+                        height: h as u32,
+                    })
+                    .await?;
+                stream.send_raw(Bytes::copy_from_slice(buf)).await?;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                sleep(FRAME_INTERVAL).await;
+                continue;
+            }
+            Err(err) => return Err(err.into()),
+        }
+
+        // Ship the cursor shape only when it changes (id is a content hash or the hidden sentinel).
+        if let Some(c) = reader.cursor() {
+            if c.id != last_cursor_id {
+                last_cursor_id = c.id;
+                stream
+                    .send(&Data::DrmCursor {
+                        id: c.id,
+                        width: c.width,
+                        height: c.height,
+                        hotx: c.hotx,
+                        hoty: c.hoty,
+                    })
+                    .await?;
+                stream.send_raw(Bytes::from(c.colors)).await?;
+            }
+        }
+
+        sleep(FRAME_INTERVAL).await;
     }
 }
 

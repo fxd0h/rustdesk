@@ -955,6 +955,15 @@ pub fn start_os_service() {
         allow_err!(crate::ipc::start(crate::POSTFIX_SERVICE));
     });
 
+    // DRM/KMS capture producer (opt-in `drm` feature): a dedicated thread + runtime that streams
+    // scanout frames to the user `--server` over the `_drm` service-scoped channel. Runs here
+    // because this process is the root service that already holds CAP_SYS_ADMIN for the in-process
+    // (direct-mode) libdrmtap read.
+    #[cfg(feature = "drm")]
+    std::thread::spawn(|| {
+        crate::ipc::start_drm();
+    });
+
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
     let (mut display, mut xauth): (String, String) = ("".to_owned(), "".to_owned());
