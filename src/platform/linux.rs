@@ -361,12 +361,6 @@ pub fn get_focused_display(displays: Vec<DisplayInfo>) -> Option<usize> {
 }
 
 pub fn get_cursor() -> ResultType<Option<u64>> {
-    #[cfg(feature = "drm")]
-    if !is_x11() {
-        if let Some(id) = scrap::drm_cursor_id() {
-            return Ok(Some(scale_tagged_cursor_id(id)));
-        }
-    }
     let mut res = None;
     DISPLAY.with(|conn| {
         if let Ok(d) = conn.try_borrow_mut() {
@@ -374,7 +368,7 @@ pub fn get_cursor() -> ResultType<Option<u64>> {
                 unsafe {
                     let img = XFixesGetCursorImage(*d);
                     if !img.is_null() {
-                        res = Some(scale_tagged_cursor_id((*img).cursor_serial as u64));
+                        res = Some((*img).cursor_serial as u64);
                         XFree(img as _);
                     }
                 }
@@ -384,158 +378,21 @@ pub fn get_cursor() -> ResultType<Option<u64>> {
     Ok(res)
 }
 
-// Cursor downscale factor for DRM/Wayland capture.
-//
-// On Wayland the cursor we can read comes from XFixes (XWayland), which renders
-// it at a HiDPI size (Xcursor.size, typically 2x). The video, however, is
-// captured at PHYSICAL resolution and the flutter client lays the cursor image
-// out in the display's LOGICAL canvas — so an unscaled XFixes cursor ends up
-// ~display-scale times too big. We divide the cursor image by the display scale
-// here so it matches the rest of the captured content. 0 bits == 1.0 (no
-// scaling), the default for X11 / unscaled displays.
-static CURSOR_DOWNSCALE_BITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-pub fn set_cursor_downscale(scale: f64) {
-    let v = if scale.is_finite() && scale > 1.0 { scale } else { 1.0 };
-    CURSOR_DOWNSCALE_BITS.store(v.to_bits(), std::sync::atomic::Ordering::Relaxed);
-}
-
-fn cursor_downscale() -> f64 {
-    let b = CURSOR_DOWNSCALE_BITS.load(std::sync::atomic::Ordering::Relaxed);
-    if b == 0 {
-        1.0
-    } else {
-        f64::from_bits(b)
-    }
-}
-
-// Fold the current cursor downscale into a cursor id. MouseCursorService only
-// re-fetches get_cursor_data() when get_cursor()'s id changes, so if the scale
-// changes (e.g. capture switches to a different-DPI monitor) while the cursor
-// SHAPE is unchanged, the client would otherwise keep the old, wrong-sized image.
-// Tagging the id with the scale makes a scale change look like a new cursor.
-// get_cursor() and get_cursor_data() must tag identically so their ids match.
-#[cfg(feature = "drm")]
-fn scale_tagged_cursor_id(raw: u64) -> u64 {
-    let q = (cursor_downscale() * 256.0).round() as u64; // quantized; 1.0 -> 256
-    raw ^ q.wrapping_mul(0x9E37_79B9_7F4A_7C15)
-}
-
-// Without the drm feature there is no cursor downscale, so the id passes through
-// unchanged: the XFixes cursor path stays behaviourally identical to upstream
-// when drm is off.
-#[cfg(not(feature = "drm"))]
-#[inline]
-fn scale_tagged_cursor_id(raw: u64) -> u64 {
-    raw
-}
-
-#[cfg(all(test, feature = "drm"))]
-mod cursor_downscale_tests {
-    use super::*;
-
-    // One test, not two: both exercise the process-global CURSOR_DOWNSCALE_BITS,
-    // so keeping them in a single test keeps them sequential and race-free without
-    // pulling in a serial-test harness.
-    #[test]
-    fn cursor_downscale_behaviour() {
-        // set_cursor_downscale clamps: only > 1.0 is kept; anything else is 1.0.
-        set_cursor_downscale(0.5);
-        assert_eq!(cursor_downscale(), 1.0);
-        set_cursor_downscale(f64::NAN);
-        assert_eq!(cursor_downscale(), 1.0);
-        set_cursor_downscale(2.0);
-        assert_eq!(cursor_downscale(), 2.0);
-
-        // A scale change must change the tagged cursor id (so MouseCursorService
-        // re-fetches), while the same scale must keep it stable (no re-fetch churn).
-        let raw = 0x0123_4567_89AB_CDEFu64;
-        set_cursor_downscale(1.0);
-        let id_1x = scale_tagged_cursor_id(raw);
-        set_cursor_downscale(2.0);
-        let id_2x = scale_tagged_cursor_id(raw);
-        assert_ne!(id_1x, id_2x, "scale change should change the cursor id");
-        set_cursor_downscale(1.0);
-        assert_eq!(id_1x, scale_tagged_cursor_id(raw), "same scale, same id");
-    }
-}
-
-// Nearest-neighbor downscale of an RGBA cursor image by `factor` (> 1.0).
-fn downscale_rgba(
-    colors: &[u8],
-    w: i32,
-    h: i32,
-    hotx: i32,
-    hoty: i32,
-    factor: f64,
-) -> (i32, i32, Vec<u8>, i32, i32) {
-    let nw = ((w as f64) / factor).round().max(1.0) as i32;
-    let nh = ((h as f64) / factor).round().max(1.0) as i32;
-    let mut out = vec![0u8; (nw * nh * 4) as usize];
-    for y in 0..nh {
-        let sy = (((y as f64) * factor) as i32).min(h - 1).max(0);
-        for x in 0..nw {
-            let sx = (((x as f64) * factor) as i32).min(w - 1).max(0);
-            let si = ((sy * w + sx) * 4) as usize;
-            let di = ((y * nw + x) * 4) as usize;
-            out[di..di + 4].copy_from_slice(&colors[si..si + 4]);
-        }
-    }
-    let nhx = (((hotx as f64) / factor).round() as i32).clamp(0, nw - 1);
-    let nhy = (((hoty as f64) / factor).round() as i32).clamp(0, nh - 1);
-    (nw, nh, out, nhx, nhy)
-}
-
 pub fn get_cursor_data(hcursor: u64) -> ResultType<CursorData> {
-    #[cfg(feature = "drm")]
-    if !is_x11() {
-        if let Some(c) = scrap::drm_cursor() {
-            // The DRM cursor is updated asynchronously; its id may have advanced
-            // past hcursor between get_cursor() and get_cursor_data().  Return the
-            // latest snapshot rather than bailing, which would trigger a 10-second
-            // MouseCursorService backoff and log spam.
-            let mut cd: CursorData = Default::default();
-            cd.id = scale_tagged_cursor_id(c.id);
-            // Same logical-canvas downscale as the XFixes path: the hardware
-            // cursor buffer is in physical pixels, but the client lays it out in
-            // the display's logical canvas, so divide by the display scale.
-            let factor = cursor_downscale();
-            if factor > 1.01 && c.width > 1 && c.height > 1 {
-                let (nw, nh, ncolors, nhx, nhy) =
-                    downscale_rgba(&c.colors, c.width, c.height, c.hotx, c.hoty, factor);
-                cd.width = nw;
-                cd.height = nh;
-                cd.hotx = nhx;
-                cd.hoty = nhy;
-                cd.colors = ncolors.into();
-            } else {
-                cd.width = c.width;
-                cd.height = c.height;
-                cd.hotx = c.hotx;
-                cd.hoty = c.hoty;
-                cd.colors = c.colors.into();
-            }
-            return Ok(cd);
-        }
-    }
     let mut res = None;
     DISPLAY.with(|conn| {
         if let Ok(ref mut d) = conn.try_borrow_mut() {
             if !d.is_null() {
                 unsafe {
                     let img = XFixesGetCursorImage(**d);
-                    // hcursor comes from get_cursor(), which tags the id with the
-                    // scale; tag this side too so the match still holds.
-                    if !img.is_null()
-                        && hcursor == scale_tagged_cursor_id((*img).cursor_serial as u64)
-                    {
+                    if !img.is_null() && hcursor == (*img).cursor_serial as u64 {
                         let mut cd: CursorData = Default::default();
                         cd.hotx = (*img).xhot as _;
                         cd.hoty = (*img).yhot as _;
                         cd.width = (*img).width as _;
                         cd.height = (*img).height as _;
                         // to-do: how about if it is 0
-                        cd.id = scale_tagged_cursor_id((*img).cursor_serial as u64);
+                        cd.id = (*img).cursor_serial as u64;
                         let pixels =
                             std::slice::from_raw_parts((*img).pixels, (cd.width * cd.height) as _);
                         // cd.colors.resize(pixels.len() * 4, 0);
@@ -558,19 +415,7 @@ pub fn get_cursor_data(hcursor: u64) -> ResultType<CursorData> {
                                 cd_colors[pos + 3] = a as _;
                             }
                         }
-                        let factor = cursor_downscale();
-                        if factor > 1.01 && cd.width > 1 && cd.height > 1 {
-                            let (nw, nh, ncolors, nhx, nhy) = downscale_rgba(
-                                &cd_colors, cd.width, cd.height, cd.hotx, cd.hoty, factor,
-                            );
-                            cd.width = nw;
-                            cd.height = nh;
-                            cd.hotx = nhx;
-                            cd.hoty = nhy;
-                            cd.colors = ncolors.into();
-                        } else {
-                            cd.colors = cd_colors.into();
-                        }
+                        cd.colors = cd_colors.into();
                         res = Some(cd);
                     }
                     if !img.is_null() {

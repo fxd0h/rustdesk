@@ -4466,15 +4466,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "libdrmtap-sys"
-version = "0.4.5"
-source = "git+https://github.com/rustdesk-org/libdrmtap?rev=df530502e69183de0b6aba36403ef811eff3a4ef#df530502e69183de0b6aba36403ef811eff3a4ef"
-dependencies = [
- "cc",
- "pkg-config",
-]
-
-[[package]]
 name = "libgit2-sys"
 version = "0.14.2+1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7326,7 +7317,6 @@ dependencies = [
  "kcp-sys",
  "keepawake",
  "lazy_static",
- "libdrmtap-sys",
  "libpulse-binding",
  "libpulse-simple-binding",
  "libxdo-sys",
@@ -7623,7 +7613,6 @@ dependencies = [
  "hwcodec",
  "jni",
  "lazy_static",
- "libdrmtap-sys",
  "log",
  "ndk 0.7.0",
  "ndk-context",

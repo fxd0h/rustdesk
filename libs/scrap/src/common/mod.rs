@@ -17,17 +17,10 @@ cfg_if! {
                 mod wayland;
                 mod x11;
                 #[cfg(all(target_os = "linux", feature = "drm"))]
-                mod drm;
-                #[cfg(all(target_os = "linux", feature = "drm"))]
                 pub mod drmtap_dl;
                 #[cfg(all(target_os = "linux", feature = "drm"))]
                 pub mod drm_reader;
                 pub use self::linux::*;
-                #[cfg(all(target_os = "linux", feature = "drm"))]
-                pub use self::drm::{
-                    capture_available as drm_capture_available, drm_cursor, drm_cursor_id,
-                    DrmCursor,
-                };
                 pub use self::wayland::set_map_err;
                 pub use self::x11::PixelBuffer;
             } else {

@@ -175,24 +175,14 @@ pub(super) async fn check_init() -> ResultType<()> {
                 }
 
                 let mut all = Display::all()?;
-                // When DRM/KMS capture is active the displays are already enumerated
-                // correctly; skip PipeWire fill_displays (which needs a portal session).
-                #[cfg(feature = "drm")]
-                let is_drm = all.first().map_or(false, |d| matches!(d, Display::DRM(_)));
-                #[cfg(not(feature = "drm"))]
-                let is_drm = false;
-                if is_drm {
-                    log::info!("DRM/KMS displays detected, skipping PipeWire initialisation");
-                } else {
-                    log::debug!("Initializing displays with fill_displays()");
-                    {
-                        let temp_mouse_move_handle = input_service::TemporaryMouseMoveHandle::new();
-                        let move_mouse_to = |x, y| temp_mouse_move_handle.move_mouse_to(x, y);
-                        fill_displays(move_mouse_to, crate::get_cursor_pos, &mut all)?;
-                    }
-                    log::debug!("Attempting to fix logical size with try_fix_logical_size()");
-                    try_fix_logical_size(&mut all);
+                log::debug!("Initializing displays with fill_displays()");
+                {
+                    let temp_mouse_move_handle = input_service::TemporaryMouseMoveHandle::new();
+                    let move_mouse_to = |x, y| temp_mouse_move_handle.move_mouse_to(x, y);
+                    fill_displays(move_mouse_to, crate::get_cursor_pos, &mut all)?;
                 }
+                log::debug!("Attempting to fix logical size with try_fix_logical_size()");
+                try_fix_logical_size(&mut all);
                 *PIPEWIRE_INITIALIZED.write().unwrap() = true;
                 let num = all.len();
                 let primary = super::display_service::get_primary_2(&all);
@@ -316,22 +306,6 @@ pub(super) fn get_capturer_for_display(
         let cap_display_info: *const CapDisplayInfo = *addr as _;
         unsafe {
             let cap_display_info = &*cap_display_info;
-            // Set the cursor downscale from the display actually being served.
-            // On Wayland get_capturer_monitor() returns through here BEFORE
-            // create_capturer(), so create_capturer's update never runs; this is
-            // the live wiring point. displays[current].scale already carries the
-            // logical-scale gating (1.0 unless multi-monitor logical), so a
-            // mixed-DPI setup uses THIS monitor's scale for the hardware cursor.
-            #[cfg(feature = "drm")]
-            if let Some(d) = cap_display_info.displays.get(cap_display_info.current) {
-                log::debug!(
-                    "serving display {} '{}' scale {} -> cursor downscale",
-                    cap_display_info.current,
-                    d.name,
-                    d.scale
-                );
-                crate::platform::linux::set_cursor_downscale(d.scale);
-            }
             let rect = cap_display_info.rects[cap_display_info.current];
             Ok(super::video_service::CapturerInfo {
                 origin: rect.0,
