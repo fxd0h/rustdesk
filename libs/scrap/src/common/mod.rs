@@ -18,6 +18,8 @@ cfg_if! {
                 mod x11;
                 #[cfg(all(target_os = "linux", feature = "drm"))]
                 mod drm;
+                #[cfg(all(target_os = "linux", feature = "drm"))]
+                pub mod drmtap_dl;
                 pub use self::linux::*;
                 #[cfg(all(target_os = "linux", feature = "drm"))]
                 pub use self::drm::{
