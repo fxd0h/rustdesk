@@ -1476,6 +1476,14 @@ pub(crate) fn drm_ipc_path() -> String {
     dir.join("ipc_drm").to_string_lossy().into_owned()
 }
 
+/// Connect (from the user `--server`) to the root service's `_drm` capture channel. Uses the
+/// derived `drm_ipc_path()` rather than `Config::ipc_path` since `_drm` is not a hbb_common
+/// service postfix (Option 2 isolation — no shared-lib change).
+#[cfg(all(target_os = "linux", feature = "drm"))]
+pub(crate) async fn connect_drm(ms_timeout: u64) -> ResultType<ConnectionTmpl<ConnClient>> {
+    connect_with_path(ms_timeout, &drm_ipc_path()).await
+}
+
 /// Bind the `_drm` listener. Unlike `new_listener`, this does not route through hbb_common's
 /// service-postfix machinery — it places the socket in the shared service dir directly, so the
 /// drm-off build needs no hbb_common change. The socket is 0666 (world-connectable) so the

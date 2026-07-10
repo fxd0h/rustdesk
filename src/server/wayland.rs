@@ -109,6 +109,13 @@ struct CapDisplayInfo {
 
 #[tokio::main(flavor = "current_thread")]
 pub(super) async fn ensure_inited() -> ResultType<()> {
+    // DRM/KMS capture (opt-in): the root service owns the reader and the capturer self-inits over
+    // IPC, so there is nothing to initialize here (and PipeWire's check_init would fail on a
+    // login-screen/no-portal host).
+    #[cfg(feature = "drm")]
+    if super::drm_capturer::is_available() {
+        return Ok(());
+    }
     check_init().await
 }
 
@@ -116,6 +123,10 @@ pub(super) fn is_inited() -> Option<Message> {
     if is_x11() {
         None
     } else {
+        #[cfg(feature = "drm")]
+        if super::drm_capturer::is_available() {
+            return None;
+        }
         if CAP_DISPLAY_INFO.read().unwrap().is_empty() {
             let mut msg_out = Message::new();
             let res = MessageBox {
@@ -231,6 +242,12 @@ pub(super) async fn check_init() -> ResultType<()> {
 }
 
 pub(super) async fn get_displays() -> ResultType<Vec<DisplayInfo>> {
+    #[cfg(feature = "drm")]
+    if super::drm_capturer::is_available() {
+        if let Some(displays) = super::drm_capturer::get_display_infos() {
+            return Ok(displays);
+        }
+    }
     check_init().await?;
     let cap_map = CAP_DISPLAY_INFO.read().unwrap();
     if let Some(addr) = cap_map.values().next() {
@@ -245,6 +262,11 @@ pub(super) async fn get_displays() -> ResultType<Vec<DisplayInfo>> {
 }
 
 pub(super) fn get_primary() -> ResultType<usize> {
+    // DRM/KMS first cut streams the primary; multi-monitor selection lands in P6.
+    #[cfg(feature = "drm")]
+    if super::drm_capturer::is_available() {
+        return Ok(0);
+    }
     let cap_map = CAP_DISPLAY_INFO.read().unwrap();
     if let Some(addr) = cap_map.values().next() {
         let cap_display_info: *const CapDisplayInfo = *addr as _;
@@ -261,6 +283,8 @@ pub fn clear() {
     if is_x11() {
         return;
     }
+    #[cfg(feature = "drm")]
+    super::drm_capturer::clear();
     let mut write_lock = CAP_DISPLAY_INFO.write().unwrap();
     for (_, addr) in write_lock.iter() {
         let cap_display_info: *mut CapDisplayInfo = *addr as _;
@@ -280,6 +304,12 @@ pub(super) fn get_capturer_for_display(
 ) -> ResultType<super::video_service::CapturerInfo> {
     if is_x11() {
         bail!("Do not call this function if not wayland");
+    }
+    // DRM/KMS capture path: build the capturer straight from the service `_drm` stream, bypassing
+    // the PipeWire CAP_DISPLAY_INFO machinery entirely.
+    #[cfg(feature = "drm")]
+    if super::drm_capturer::is_available() {
+        return super::drm_capturer::get_capturer_info(display_idx);
     }
     let cap_map = CAP_DISPLAY_INFO.read().unwrap();
     if let Some(addr) = cap_map.get(&display_idx) {
