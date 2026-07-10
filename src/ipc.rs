@@ -1593,9 +1593,14 @@ async fn handle_drm_conn(mut stream: Connection) -> ResultType<()> {
     // streamed for now.
 
     let mut last_cursor_id: u64 = 0;
+    // Bound continuous no-frame (WouldBlock) time so a wedged device tears the stream
+    // down (client falls back) instead of freezing forever. ~5s at FRAME_INTERVAL.
+    let mut stalled: u32 = 0;
+    const MAX_STALLED: u32 = 150;
     loop {
         match reader.grab() {
             Ok((buf, w, h)) => {
+                stalled = 0;
                 stream
                     .send(&Data::DrmFrame {
                         width: w as u32,
@@ -1605,6 +1610,10 @@ async fn handle_drm_conn(mut stream: Connection) -> ResultType<()> {
                 stream.send_raw(Bytes::copy_from_slice(buf)).await?;
             }
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                stalled += 1;
+                if stalled > MAX_STALLED {
+                    bail!("drm capture stalled: no frame for too long");
+                }
                 sleep(FRAME_INTERVAL).await;
                 continue;
             }

@@ -120,9 +120,18 @@ impl DrmReader {
             let mut frame: drmtap_frame_info = std::mem::zeroed();
             let ret = (self.lib.grab_mapped)(self.ctx, &mut frame);
             if ret < 0 {
+                let errno = -ret;
+                // Transient contention (compositor mid page-flip, device momentarily
+                // busy, interrupted syscall) -> retry rather than tear the stream down.
+                if errno == hbb_common::libc::EAGAIN
+                    || errno == hbb_common::libc::EBUSY
+                    || errno == hbb_common::libc::EINTR
+                {
+                    return Err(io::ErrorKind::WouldBlock.into());
+                }
                 return Err(io::Error::new(
                     io::ErrorKind::Other,
-                    format!("drmtap_grab_mapped failed: errno {}", -ret),
+                    format!("drmtap_grab_mapped failed: errno {errno}"),
                 ));
             }
             if frame.data.is_null() || frame.width == 0 || frame.height == 0 {
