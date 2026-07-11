@@ -69,10 +69,12 @@ pub struct DrmReader {
 
 impl DrmReader {
     /// Open the DRM device. `device = None` auto-detects (safe); `Some(path)` is
-    /// realpath-gated to /dev/dri/. Returns None if libdrmtap is unavailable
-    /// (dlopen failed), the device is not allowed, or the open failed — the
-    /// caller then falls back to PipeWire/portal.
-    pub fn open(device: Option<&str>) -> Option<DrmReader> {
+    /// realpath-gated to /dev/dri/. `crtc_id = 0` auto-selects the first active
+    /// CRTC (primary); a non-zero value targets that specific CRTC/display (from
+    /// `displays()`). Returns None if libdrmtap is unavailable (dlopen failed),
+    /// the device is not allowed, or the open failed — the caller then falls back
+    /// to PipeWire/portal.
+    pub fn open(device: Option<&str>, crtc_id: u32) -> Option<DrmReader> {
         let lib = drmtap_dl::get()?;
         let device_cstr = match device {
             None => None,
@@ -89,7 +91,7 @@ impl DrmReader {
         };
         let cfg = drmtap_config {
             device_path: device_cstr.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
-            crtc_id: 0,
+            crtc_id,
             helper_path: std::ptr::null(),
             debug: 0,
         };

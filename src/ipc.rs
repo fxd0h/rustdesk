@@ -1557,40 +1557,53 @@ async fn handle_drm_conn(mut stream: Connection) -> ResultType<()> {
         return Ok(());
     }
 
-    let mut reader = match scrap::drm_reader::DrmReader::open(None) {
-        Some(r) => r,
-        None => {
-            log::info!("drm: reader unavailable; closing _drm connection (client will fall back)");
-            return Ok(());
-        }
+    // Enumerate the displays with an auto-selected reader, then close it; the capture reader is
+    // (re)opened below for the CRTC the client picks.
+    let displays = {
+        let mut enum_reader = match scrap::drm_reader::DrmReader::open(None, 0) {
+            Some(r) => r,
+            None => {
+                log::info!("drm: reader unavailable; closing _drm connection (client falls back)");
+                return Ok(());
+            }
+        };
+        enum_reader
+            .displays()
+            .into_iter()
+            .map(|d| DrmDisplayInfo {
+                name: d.name,
+                crtc_id: d.crtc_id,
+                x: d.x,
+                y: d.y,
+                width: d.width,
+                height: d.height,
+                active: d.active,
+            })
+            .collect::<Vec<_>>()
     };
-
-    // Ship the display list first so the client can pick + size its capturer.
-    let displays = reader
-        .displays()
-        .into_iter()
-        .map(|d| DrmDisplayInfo {
-            name: d.name,
-            crtc_id: d.crtc_id,
-            x: d.x,
-            y: d.y,
-            width: d.width,
-            height: d.height,
-            active: d.active,
-        })
-        .collect::<Vec<_>>();
-    stream.send(&Data::DrmDisplayList(displays)).await?;
+    stream.send(&Data::DrmDisplayList(displays.clone())).await?;
 
     // Wait for the client to choose a display before streaming.
-    let _display = loop {
+    let display_idx = loop {
         match stream.next_timeout(10_000).await? {
             Some(Data::DrmStart { display }) => break display,
             Some(_) => continue,
             None => return Ok(()),
         }
     };
-    // TODO(P6 multi-monitor): map `_display` to a crtc and target it; the primary scanout is
-    // streamed for now.
+    // Target the chosen display's CRTC (0 = the first active / primary).
+    let target_crtc = usize::try_from(display_idx)
+        .ok()
+        .and_then(|i| displays.get(i))
+        .map(|d| d.crtc_id)
+        .unwrap_or(0);
+    let mut reader = match scrap::drm_reader::DrmReader::open(None, target_crtc) {
+        Some(r) => r,
+        None => {
+            log::warn!("drm: failed to open crtc {target_crtc}; closing _drm connection");
+            return Ok(());
+        }
+    };
 
     let mut last_cursor_id: u64 = 0;
     // Bound continuous no-frame (WouldBlock) time so a wedged device tears the stream
