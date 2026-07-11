@@ -285,41 +285,157 @@ async fn query_displays_async() -> ResultType<Vec<DrmDisplayInfo>> {
     }
 }
 
-/// Whether the root service offers DRM/KMS capture. Probed once and cached (both the positive and
-/// negative result) until `clear()`.
+// Transient-failure budget for the cold probe: a `_drm` probe can fail transiently (the producer
+// is not up yet, a connection race), so we retry across a few connections before durably giving up.
+// This keeps one cold-start hiccup from permanently disabling DRM capture for the session, while
+// still settling to `Unavailable` on a genuinely DRM-less host.
+static DRM_PROBE_FAILURES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+const DRM_PROBE_MAX_FAILURES: u32 = 5;
+
+/// Whether the root service offers DRM/KMS capture. The positive result and a definitive negative
+/// (connected, but no displays) are cached; a transient probe error stays `Unknown` for a few
+/// retries. Normally the cache is warmed at `--server` startup (`warm_availability`), so the first
+/// client connection hits the fast `Available` path.
 pub(super) fn is_available() -> bool {
     // Serialize the probe under the lock: the enumeration hooks all call this, and a burst of
-    // concurrent callers would otherwise open several redundant `_drm` probe connections. Holding
-    // the lock does exactly one probe; it is fast (the listener answers the display list on connect)
-    // and the result is cached durably.
+    // concurrent callers would otherwise open several redundant `_drm` probe connections.
     let mut st = DRM_STATE.lock().unwrap();
     match &*st {
         ProbeState::Available(_) => true,
         ProbeState::Unavailable => false,
-        ProbeState::Unknown => match query_displays() {
-            Ok(list) if !list.is_empty() => {
-                *st = ProbeState::Available(list);
-                true
+        ProbeState::Unknown => {
+            let t = Instant::now();
+            match query_displays() {
+                Ok(list) if !list.is_empty() => {
+                    log::info!(
+                        "drm: availability probe -> available ({} displays) in {:?}",
+                        list.len(),
+                        t.elapsed()
+                    );
+                    *st = ProbeState::Available(list);
+                    true
+                }
+                Ok(_) => {
+                    log::info!("drm: availability probe -> no displays in {:?}", t.elapsed());
+                    *st = ProbeState::Unavailable;
+                    false
+                }
+                Err(err) => {
+                    let n = DRM_PROBE_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n >= DRM_PROBE_MAX_FAILURES {
+                        log::info!("drm: availability probe failed {n}x ({err}); disabling DRM");
+                        *st = ProbeState::Unavailable;
+                    } else {
+                        // Stay Unknown so the next connection re-probes (cold-start race).
+                        log::info!(
+                            "drm: availability probe failed ({err}), attempt {n}/{DRM_PROBE_MAX_FAILURES}; will retry"
+                        );
+                    }
+                    false
+                }
             }
-            Ok(_) => {
-                *st = ProbeState::Unavailable;
-                false
-            }
-            Err(err) => {
-                log::debug!("drm capture not available: {err}");
-                *st = ProbeState::Unavailable;
-                false
-            }
-        },
+        }
     }
 }
 
-/// The cached DRM displays as protobuf `DisplayInfo` (physical geometry; logical scale needs the
-/// user session so it stays 1.0 for now — refined in P6). `None` until probed/available.
+/// Warm the availability cache at `--server` startup so the first client connection does not race a
+/// cold `_drm` probe. A cold probe blocks display enumeration, and if it has not settled when the
+/// peer info is built the display list goes out empty and the client shows "No displays" and
+/// retries (the "connects on the Nth try" symptom). Probes with a short retry budget and only caches
+/// the positive result; a genuinely DRM-less host just falls through to the lazy `is_available()`.
+pub(super) fn warm_availability() {
+    for _ in 0..10 {
+        if matches!(&*DRM_STATE.lock().unwrap(), ProbeState::Available(_)) {
+            return;
+        }
+        match query_displays() {
+            Ok(list) if !list.is_empty() => {
+                log::info!("drm: consumer cache warmed ({} displays) at startup", list.len());
+                *DRM_STATE.lock().unwrap() = ProbeState::Available(list);
+                return;
+            }
+            // Producer not ready yet (or no DRM): back off and retry; never cache a negative here.
+            _ => std::thread::sleep(Duration::from_millis(300)),
+        }
+    }
+    log::info!("drm: consumer cache warm found no producer at startup (will probe lazily)");
+}
+
+/// The cached DRM displays as protobuf `DisplayInfo`, augmented with the compositor's logical layout
+/// (per-monitor position + scale). `None` until probed/available.
 pub(super) fn get_display_infos() -> Option<Vec<DisplayInfo>> {
-    match &*DRM_STATE.lock().unwrap() {
-        ProbeState::Available(list) => Some(list.iter().map(display_info_from_drm).collect()),
-        _ => None,
+    let list = match &*DRM_STATE.lock().unwrap() {
+        ProbeState::Available(list) => list.clone(),
+        _ => return None,
+    };
+    Some(augment_with_wayland_geometry(&list))
+}
+
+/// The DRM enumeration reports every monitor at physical size and origin (0,0) — it deliberately
+/// does not know the compositor's logical desktop layout. On a multi-monitor host that leaves the
+/// client stacking all displays at (0,0), and input/cursor coordinates (mapped through each
+/// display's logical origin + scale) land on the wrong output. So we augment here from the Wayland
+/// outputs — the same source the uinput desktop-rect uses — matching by connector name (normalized:
+/// DRM "HDMI-A-1" vs compositor "HDMI-1") and falling back to a unique physical resolution. This is
+/// the "server augments the DRM geometry with the Wayland logical geometry" step. A single display
+/// (already at 0,0, scale 1.0) needs no augmentation, matching the PipeWire path's logical-scale gate.
+fn augment_with_wayland_geometry(drm: &[DrmDisplayInfo]) -> Vec<DisplayInfo> {
+    let wl = scrap::wayland::display::get_displays();
+    let multi = drm.len() > 1 && wl.displays.len() > 1;
+    drm.iter()
+        .map(|d| {
+            let mut info = display_info_from_drm(d);
+            if multi {
+                if let Some(w) = match_wayland_display(d, &wl.displays) {
+                    info.x = w.x;
+                    info.y = w.y;
+                    if let Some((lw, lh)) = w.logical_size {
+                        if lw > 0 && lh > 0 {
+                            info.scale = d.width as f64 / lw as f64;
+                            // original_resolution is the logical size (physical / scale).
+                            info.original_resolution = super::display_service::get_original_resolution(
+                                &d.name,
+                                lw as usize,
+                                lh as usize,
+                            );
+                        }
+                    }
+                }
+            }
+            info
+        })
+        .collect()
+}
+
+/// Match a DRM display to its compositor output: by normalized connector name first, then by a
+/// uniquely-matching physical resolution.
+fn match_wayland_display<'a>(
+    d: &DrmDisplayInfo,
+    wl: &'a [hbb_common::platform::linux::WaylandDisplayInfo],
+) -> Option<&'a hbb_common::platform::linux::WaylandDisplayInfo> {
+    let dn = normalize_connector(&d.name);
+    if let Some(w) = wl.iter().find(|w| normalize_connector(&w.name) == dn) {
+        return Some(w);
+    }
+    let same_res: Vec<_> = wl
+        .iter()
+        .filter(|w| w.width == d.width as i32 && w.height == d.height as i32)
+        .collect();
+    if same_res.len() == 1 {
+        return Some(same_res[0]);
+    }
+    None
+}
+
+/// Normalize a connector name for cross-source matching: DRM inserts a single-letter type
+/// discriminator that the compositor drops ("HDMI-A-1" -> "HDMI-1", "DVI-D-1" -> "DVI-1"); names
+/// like "DP-1" / "eDP-1" pass through unchanged.
+fn normalize_connector(name: &str) -> String {
+    let parts: Vec<&str> = name.split('-').collect();
+    if parts.len() == 3 && parts[1].len() == 1 {
+        format!("{}-{}", parts[0], parts[2])
+    } else {
+        name.to_string()
     }
 }
 
