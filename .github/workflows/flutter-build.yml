@@ -1690,8 +1690,11 @@ jobs:
               # drm-off build stays identical to upstream. libdrmtap's meson.build
               # needs meson >= 0.57 (fs.read) + `meson compile` (>= 0.54); the distro
               # apt meson is far older on the 18.04 build container, so install it via
-              # pip (pinned < 0.62 for the container's python 3.6).
-              apt-get install -y ninja-build libdrm-dev libegl-dev libgles-dev python3-pip
+              # pip (pinned < 0.62 for the container's python 3.6). The EGL/GLES dev
+              # packages must be the mesa-specific names (libegl1-mesa-dev /
+              # libgles2-mesa-dev): the newer libegl-dev / libgles-dev metapackages
+              # do not exist on the ubuntu18.04 build container.
+              apt-get install -y ninja-build libdrm-dev libegl1-mesa-dev libgles2-mesa-dev python3-pip
               python3 -m pip install --upgrade pip
               python3 -m pip install 'meson>=0.57,<0.62'
               git submodule update --init third_party/libdrmtap
