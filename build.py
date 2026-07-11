@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import os
+import glob
 import pathlib
 import platform
 import zipfile
@@ -133,8 +134,8 @@ def make_parser():
     parser.add_argument(
         '--drm',
         action='store_true',
-        help='Linux only: build the DRM/KMS capture backend (ships the privileged '
-             'drmtap-helper, installed 0750 root:rustdesk-capture). Off by default.'
+        help='Linux only: build the DRM/KMS capture backend (bundles libdrmtap.so, '
+             'dlopen-ed in-process by the root service). Off by default.'
     )
     parser.add_argument(
         '--skip-cargo',
@@ -331,23 +332,39 @@ def ffi_bindgen_function_refactor():
         'sed -i "s/ffi.NativeFunction<ffi.Bool Function(DartPort/ffi.NativeFunction<ffi.Uint8 Function(DartPort/g" flutter/lib/generated_bridge.dart')
 
 
-def append_drm_helper_postinst():
-    # Append the helper group + setcap setup to the DRM package's postinst. Only
-    # the DRM package calls this, so the stock package's DEBIAN/postinst stays
-    # byte-identical to upstream. cap_sys_admin is granted but kept out of
-    # world-exec (a world-exec cap_sys_admin binary lets any local user read the
-    # active scanout, incl. the login/lock screen), so it is restricted to a
-    # dedicated group before setcap runs.
+def build_libdrmtap_so():
+    # Build libdrmtap.so from the pinned rustdesk-org/libdrmtap submodule via meson.
+    # The pivot dlopen-s this .so in-process in the root service (which already holds
+    # CAP_SYS_ADMIN) — no setcap helper, no privileged child. Only the shared library
+    # target is built (the submodule also carries a helper binary we do not ship).
+    # Returns the path to the built versioned .so (e.g. .../libdrmtap.so.0.4.4).
+    repo_root = os.path.dirname(os.path.abspath(__file__))
+    submodule = os.path.join(repo_root, 'third_party', 'libdrmtap')
+    if not os.path.exists(os.path.join(submodule, 'meson.build')):
+        raise Exception(
+            'third_party/libdrmtap is empty — run `git submodule update --init third_party/libdrmtap`')
+    build_dir = os.path.join(submodule, 'build-pkg')
+    if not os.path.exists(os.path.join(build_dir, 'build.ninja')):
+        system2(f'meson setup {build_dir} {submodule} --buildtype=release')
+    # Build only the shared library target ('drmtap'), not the bundled helper binary.
+    system2(f'meson compile -C {build_dir} drmtap')
+    sos = glob.glob(os.path.join(build_dir, 'libdrmtap.so.0.*'))
+    # keep the real object (libdrmtap.so.0.4.4), not the .so/.so.0 symlinks or meson's .p dir
+    sos = [p for p in sos if os.path.isfile(p) and not os.path.islink(p)]
+    if not sos:
+        raise Exception('libdrmtap build produced no libdrmtap.so.0.* object')
+    return sos[0]
+
+
+def append_drm_ldconfig_postinst():
+    # The DRM package installs libdrmtap.so under a private dir; register it with the
+    # dynamic linker so the in-process dlopen("libdrmtap.so.0") resolves. Only the DRM
+    # package calls this, so the stock package's postinst stays byte-identical to upstream.
     with open('tmpdeb/DEBIAN/postinst', 'a') as f:
         f.write(
             '\n'
-            'if [ "$1" = configure ] && [ -f /usr/lib/rustdesk/drmtap-helper ]; then\n'
-            '\tgroupadd -f -r rustdesk-capture 2>/dev/null || addgroup --system rustdesk-capture 2>/dev/null || true\n'
-            '\tchown root:rustdesk-capture /usr/lib/rustdesk/drmtap-helper 2>/dev/null || true\n'
-            '\tchmod 0750 /usr/lib/rustdesk/drmtap-helper\n'
-            '\tif command -v setcap >/dev/null; then\n'
-            '\t\tsetcap cap_sys_admin+ep /usr/lib/rustdesk/drmtap-helper || echo "rustdesk: warning: setcap on drmtap-helper failed; DRM/KMS capture will fall back to PipeWire" >&2\n'
-            '\tfi\n'
+            'if [ "$1" = configure ] && [ -d /usr/lib/rustdesk ]; then\n'
+            '\tldconfig /usr/lib/rustdesk 2>/dev/null || ldconfig 2>/dev/null || true\n'
             'fi\n'
         )
 
@@ -388,27 +405,34 @@ def build_flutter_deb(version, features):
         'cp ../res/pam.d/rustdesk.debian tmpdeb/etc/pam.d/rustdesk')
     system2(
         "echo \"#!/bin/sh\" >> tmpdeb/usr/share/rustdesk/files/polkit && chmod a+x tmpdeb/usr/share/rustdesk/files/polkit")
-    # Install drmtap-helper for the privileged DRM/KMS capture path — but ONLY
-    # when this build actually enabled the `drm` feature. Gating on the feature
-    # (not on whether a stale ../target/release/drmtap-helper happens to exist
-    # from an earlier --drm build) keeps the opt-in guarantee for normal packages.
-    ships_helper = 'drm' in features
-    if ships_helper:
+    # Bundle libdrmtap.so for the DRM/KMS capture path — but ONLY when this build
+    # actually enabled the `drm` feature, so normal packages stay opt-out. The root
+    # service dlopen-s it in-process (no setcap helper); it lives in a private dir
+    # that postinst registers with ldconfig so dlopen("libdrmtap.so.0") resolves.
+    ships_so = 'drm' in features
+    if ships_so:
+        so_path = build_libdrmtap_so()
+        soname = 'libdrmtap.so.0'
         system2('mkdir -p tmpdeb/usr/lib/rustdesk')
-        system2('cp ../target/release/drmtap-helper tmpdeb/usr/lib/rustdesk/drmtap-helper')
+        system2(f'cp {so_path} tmpdeb/usr/lib/rustdesk/')
+        system2(f'ln -sf {os.path.basename(so_path)} tmpdeb/usr/lib/rustdesk/{soname}')
+        system2('mkdir -p tmpdeb/etc/ld.so.conf.d')
+        with open('tmpdeb/etc/ld.so.conf.d/rustdesk-unattended-wayland.conf', 'w') as f:
+            f.write('/usr/lib/rustdesk\n')
 
     # A DRM build ships as a separately-named, opt-in package so installing it is
     # an explicit choice; the package name itself states what it enables. It is
     # an alternative build of the same app, so generate_control_file marks it
     # Conflicts/Replaces/Provides rustdesk (install one or the other).
-    package_name = 'rustdesk-unattended-wayland' if ships_helper else 'rustdesk'
+    package_name = 'rustdesk-unattended-wayland' if ships_so else 'rustdesk'
     system2('mkdir -p tmpdeb/DEBIAN')
-    # postinst runs setcap (from libcap2-bin) on the helper; make it a hard
-    # dependency so a DRM package can't install an unusable, cap-less helper.
-    generate_control_file(version, ", libcap2-bin" if ships_helper else "", package_name)
+    # libdrmtap's runtime deps (libdrm / EGL / GLESv2); the .so fails to dlopen and
+    # the capture falls back to PipeWire without them, so make them hard deps.
+    drm_depends = ", libdrm2, libegl1, libgles2" if ships_so else ""
+    generate_control_file(version, drm_depends, package_name)
     system2('cp -a ../res/DEBIAN/* tmpdeb/DEBIAN/')
-    if ships_helper:
-        append_drm_helper_postinst()
+    if ships_so:
+        append_drm_ldconfig_postinst()
     md5_file_folder("tmpdeb/")
     system2('dpkg-deb -b tmpdeb rustdesk.deb;')
 
@@ -442,29 +466,32 @@ def build_deb_from_folder(version, binary_folder):
         'cp ../res/rustdesk-link.desktop tmpdeb/usr/share/applications/rustdesk-link.desktop')
     system2(
         "echo \"#!/bin/sh\" >> tmpdeb/usr/share/rustdesk/files/polkit && chmod a+x tmpdeb/usr/share/rustdesk/files/polkit")
-    # Install drmtap-helper for the DRM/KMS capture path from the STAGED payload
-    # (binary_folder), not from ../target/release — that tree may be unrelated or
-    # stale for a prebuilt / cross-arch bundle. The helper is only in the payload
-    # when the bundle was built with the `drm` feature, so this stays opt-in. The
-    # `cp -r` above already placed any bundled drmtap-helper under
-    # usr/share/rustdesk/; move it to usr/lib/rustdesk/ where postinst applies the
-    # 0750 + capability.
-    system2('mkdir -p tmpdeb/usr/lib/rustdesk')
-    system2('if [ -f tmpdeb/usr/share/rustdesk/drmtap-helper ]; then mv tmpdeb/usr/share/rustdesk/drmtap-helper tmpdeb/usr/lib/rustdesk/drmtap-helper; fi')
+    # Bundle libdrmtap.so for the DRM/KMS capture path from the STAGED payload
+    # (binary_folder) — a prebuilt / cross-arch bundle carries its own .so, so we do
+    # not rebuild it here. The `cp -r` above placed any bundled libdrmtap.so.0* under
+    # usr/share/rustdesk/; move it to the private lib dir and register with ldconfig.
+    bundled_so = glob.glob('tmpdeb/usr/share/rustdesk/libdrmtap.so.0.*')
+    bundled_so = [p for p in bundled_so if os.path.isfile(p) and not os.path.islink(p)]
+    ships_so = len(bundled_so) > 0
+    if ships_so:
+        so = bundled_so[0]
+        system2('mkdir -p tmpdeb/usr/lib/rustdesk')
+        system2(f'mv {so} tmpdeb/usr/lib/rustdesk/')
+        system2('rm -f tmpdeb/usr/share/rustdesk/libdrmtap.so tmpdeb/usr/share/rustdesk/libdrmtap.so.0')
+        system2(f'ln -sf {os.path.basename(so)} tmpdeb/usr/lib/rustdesk/libdrmtap.so.0')
+        system2('mkdir -p tmpdeb/etc/ld.so.conf.d')
+        with open('tmpdeb/etc/ld.so.conf.d/rustdesk-unattended-wayland.conf', 'w') as f:
+            f.write('/usr/lib/rustdesk\n')
 
     system2('mkdir -p tmpdeb/DEBIAN')
-    # Only a bundle staged with the DRM helper needs libcap2-bin (postinst runs
-    # setcap on it); detect it in the payload so plain bundles stay unaffected.
-    ships_helper = os.path.exists('tmpdeb/usr/lib/rustdesk/drmtap-helper')
-    # A staged bundle carrying the helper is the DRM package: name it accordingly
-    # (Conflicts/Replaces/Provides rustdesk) and run the same helper setcap/group
-    # setup as build_flutter_deb, so a --package DRM bundle is not left with an
-    # unusable, cap-less helper under the stock package name.
-    package_name = 'rustdesk-unattended-wayland' if ships_helper else 'rustdesk'
-    generate_control_file(version, ", libcap2-bin" if ships_helper else "", package_name)
+    # A staged bundle carrying the .so is the DRM package: name it accordingly
+    # (Conflicts/Replaces/Provides rustdesk) and add libdrmtap's runtime deps.
+    package_name = 'rustdesk-unattended-wayland' if ships_so else 'rustdesk'
+    drm_depends = ", libdrm2, libegl1, libgles2" if ships_so else ""
+    generate_control_file(version, drm_depends, package_name)
     system2('cp -a ../res/DEBIAN/* tmpdeb/DEBIAN/')
-    if ships_helper:
-        append_drm_helper_postinst()
+    if ships_so:
+        append_drm_ldconfig_postinst()
     md5_file_folder("tmpdeb/")
     system2('dpkg-deb -b tmpdeb rustdesk.deb;')
 
