@@ -1543,6 +1543,49 @@ impl Drop for DrmStopGuard {
     }
 }
 
+/// Cached DRM display enumeration. The pre-warm populates it and each capture open refreshes it, so
+/// a consumer's handshake can send the display list without first paying a DRM enumeration open.
+#[cfg(all(target_os = "linux", feature = "drm"))]
+static DRM_DISPLAY_CACHE: std::sync::Mutex<Vec<DrmDisplayInfo>> = std::sync::Mutex::new(Vec::new());
+
+/// Snapshot a reader's enumerated displays as the IPC `DrmDisplayInfo` form. `displays()` lists all
+/// device outputs regardless of the reader's target CRTC, so a capture reader can refresh the cache.
+#[cfg(all(target_os = "linux", feature = "drm"))]
+fn drm_displays_from_reader(reader: &mut scrap::drm_reader::DrmReader) -> Vec<DrmDisplayInfo> {
+    reader
+        .displays()
+        .into_iter()
+        .map(|d| DrmDisplayInfo {
+            name: d.name,
+            crtc_id: d.crtc_id,
+            x: d.x,
+            y: d.y,
+            width: d.width,
+            height: d.height,
+            active: d.active,
+        })
+        .collect()
+}
+
+/// Best-effort warm-up at listener start: loads libdrmtap, initializes EGL, enumerates displays into
+/// the cache, and maps the first framebuffer once. Moves that one-time cost (which otherwise lands
+/// on the first consumer and can push the first frame past the client's initial-frame timeout) off
+/// the critical path. Runs on its own thread since `DrmReader` is `!Send` and `open`/`grab` block.
+#[cfg(all(target_os = "linux", feature = "drm"))]
+fn drm_prewarm() {
+    let t = std::time::Instant::now();
+    match scrap::drm_reader::DrmReader::open(None, 0) {
+        Some(mut r) => {
+            let displays = drm_displays_from_reader(&mut r);
+            let n = displays.len();
+            let _ = r.grab(); // force the first framebuffer map / import
+            *DRM_DISPLAY_CACHE.lock().unwrap() = displays;
+            log::info!("drm: pre-warm ok ({n} displays) in {:?}", t.elapsed());
+        }
+        None => log::info!("drm: pre-warm skipped (reader unavailable)"),
+    }
+}
+
 /// DRM/KMS capture producer. Runs in the ROOT `--service` (which holds CAP_SYS_ADMIN, so libdrmtap
 /// reads the scanout in-process — no helper, no setcap). One dedicated `current_thread` runtime
 /// owns the `_drm` listener and `tokio::spawn`s a task per accepted consumer, so a multi-monitor
@@ -1555,20 +1598,25 @@ impl Drop for DrmStopGuard {
 #[tokio::main(flavor = "current_thread")]
 pub async fn start_drm() {
     match new_drm_listener().await {
-        Ok(mut incoming) => loop {
-            if let Some(result) = incoming.next().await {
-                match result {
-                    Ok(stream) => {
-                        tokio::spawn(async move {
-                            if let Err(err) = handle_drm_conn(Connection::new(stream)).await {
-                                log::info!("drm ipc connection ended: {}", err);
-                            }
-                        });
+        Ok(mut incoming) => {
+            // Warm libdrmtap/EGL + enumeration off-thread so the first consumer does not pay that
+            // one-time cost on its critical path.
+            std::thread::spawn(drm_prewarm);
+            loop {
+                if let Some(result) = incoming.next().await {
+                    match result {
+                        Ok(stream) => {
+                            tokio::spawn(async move {
+                                if let Err(err) = handle_drm_conn(Connection::new(stream)).await {
+                                    log::info!("drm ipc connection ended: {}", err);
+                                }
+                            });
+                        }
+                        Err(err) => log::error!("Couldn't get drm client: {:?}", err),
                     }
-                    Err(err) => log::error!("Couldn't get drm client: {:?}", err),
                 }
             }
-        },
+        }
         Err(err) => {
             log::error!("Failed to start drm ipc server: {}", err);
         }
@@ -1606,8 +1654,9 @@ async fn handle_drm_conn(mut stream: Connection) -> ResultType<()> {
     let worker_stop = stop.clone();
     std::thread::spawn(move || drm_capture_worker(frame_tx, crtc_rx, worker_stop));
 
-    // Handshake: the worker opens an enumeration reader first and sends the display list. A closed
-    // channel (no Displays) means the reader was unavailable, so let the client fall back.
+    // Handshake: the worker sends the display list (from the pre-warmed cache, or a throwaway
+    // enumeration open if the cache is empty). A closed channel (no Displays) means the reader was
+    // unavailable, so let the client fall back.
     let displays = match frame_rx.recv().await {
         Some(DrmProducerMsg::Displays(d)) => d,
         _ => {
@@ -1692,26 +1741,21 @@ fn drm_capture_worker(
     // of freezing forever; the client then falls back.
     const MAX_STALLED: u32 = 150;
 
-    // Enumerate the displays with an auto-selected reader, then close it; the capture reader is
-    // (re)opened below for the CRTC the client picks.
+    let t_conn = std::time::Instant::now();
+
+    // Send the display list. Prefer the pre-warmed cache (skips a per-connection enumeration open);
+    // fall back to a throwaway enumeration reader if the pre-warm has not populated it yet.
     let displays = {
-        let mut enum_reader = match scrap::drm_reader::DrmReader::open(None, 0) {
-            Some(r) => r,
-            None => return,
-        };
-        enum_reader
-            .displays()
-            .into_iter()
-            .map(|d| DrmDisplayInfo {
-                name: d.name,
-                crtc_id: d.crtc_id,
-                x: d.x,
-                y: d.y,
-                width: d.width,
-                height: d.height,
-                active: d.active,
-            })
-            .collect::<Vec<_>>()
+        let cached = DRM_DISPLAY_CACHE.lock().unwrap().clone();
+        if !cached.is_empty() {
+            cached
+        } else {
+            let mut enum_reader = match scrap::drm_reader::DrmReader::open(None, 0) {
+                Some(r) => r,
+                None => return,
+            };
+            drm_displays_from_reader(&mut enum_reader)
+        }
     };
     if frame_tx
         .blocking_send(DrmProducerMsg::Displays(displays))
@@ -1725,6 +1769,7 @@ fn drm_capture_worker(
         Ok(c) => c,
         Err(_) => return,
     };
+    let t_open = std::time::Instant::now();
     let mut reader = match scrap::drm_reader::DrmReader::open(None, target_crtc) {
         Some(r) => r,
         None => {
@@ -1732,13 +1777,27 @@ fn drm_capture_worker(
             return;
         }
     };
+    // Refresh the cache from the live device so the next consumer's handshake uses fresh geometry.
+    *DRM_DISPLAY_CACHE.lock().unwrap() = drm_displays_from_reader(&mut reader);
+    log::info!(
+        "drm: capture reader for crtc {target_crtc} opened in {:?}",
+        t_open.elapsed()
+    );
 
     let mut last_cursor_id: u64 = 0;
     let mut stalled: u32 = 0;
+    let mut logged_first = false;
     while !stop.load(Ordering::Relaxed) {
         match reader.grab() {
             Ok((buf, w, h)) => {
                 stalled = 0;
+                if !logged_first {
+                    logged_first = true;
+                    log::info!(
+                        "drm: first frame {w}x{h} for crtc {target_crtc} in {:?}",
+                        t_conn.elapsed()
+                    );
+                }
                 if frame_tx
                     .blocking_send(DrmProducerMsg::Frame {
                         width: w as u32,
