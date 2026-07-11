@@ -209,8 +209,10 @@ async fn recv_thread(
 }
 
 // The latest DRM hardware-cursor snapshot, published by recv_thread and read by the cursor service
-// (platform::linux::get_cursor / get_cursor_data). One global: the common case is a single active
-// DRM stream (see the one-consumer note); a multi-stream setup shares it, last writer wins.
+// (platform::linux::get_cursor / get_cursor_data). One global shared by all active streams: a
+// multi-monitor client runs one recv_thread per display, and the hardware cursor lives on whichever
+// CRTC the pointer is over (the others report the hidden sentinel), so last-writer-wins here tracks
+// the pointer as it moves between monitors. Per-CRTC cursor routing is a later refinement.
 #[derive(Clone)]
 pub struct DrmCursorData {
     pub id: u64,
@@ -246,10 +248,11 @@ pub fn drm_cursor() -> Option<DrmCursorData> {
 // Server capture-path integration (the parallel, gated DRM path)
 //
 // The `--server` selects DRM/KMS capture over PipeWire when the root service offers the `_drm`
-// channel. Availability + the display list are probed once and cached: the service streams to ONE
-// consumer at a time, so we must NOT re-query while a capture is active (it would block behind the
-// stream). The cache is seeded before capture starts (display enumeration) and by the capturer
-// handshake, and only reset by `clear()` on teardown.
+// channel. Availability + the display list are probed once and cached: the `_drm` listener now
+// serves consumers concurrently (one connection per captured display), but re-probing on every
+// enumeration still churns connections needlessly and briefly tripped a restart loop in testing, so
+// the result is cached durably. The cache is seeded before capture starts (display enumeration) and
+// by the capturer handshake, and only reset by `clear()` on teardown.
 // ---------------------------------------------------------------------------
 
 enum ProbeState {
@@ -286,9 +289,9 @@ async fn query_displays_async() -> ResultType<Vec<DrmDisplayInfo>> {
 /// negative result) until `clear()`.
 pub(super) fn is_available() -> bool {
     // Serialize the probe under the lock: the enumeration hooks all call this, and a burst of
-    // concurrent callers would otherwise open several racing `_drm` connections that contend on the
-    // single-consumer listener and can wrongly cache Unavailable. Holding the lock does one probe;
-    // it is fast (the listener is free before any capture starts) and the result is cached durably.
+    // concurrent callers would otherwise open several redundant `_drm` probe connections. Holding
+    // the lock does exactly one probe; it is fast (the listener answers the display list on connect)
+    // and the result is cached durably.
     let mut st = DRM_STATE.lock().unwrap();
     match &*st {
         ProbeState::Available(_) => true,
