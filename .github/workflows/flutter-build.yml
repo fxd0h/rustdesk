@@ -1697,7 +1697,27 @@ jobs:
               apt-get install -y ninja-build libdrm-dev libegl1-mesa-dev libgles2-mesa-dev python3-pip
               python3 -m pip install --upgrade pip
               python3 -m pip install 'meson>=0.57,<0.62'
-              git submodule update --init third_party/libdrmtap
+              # Materialize the libdrmtap source inside the run-on-arch container.
+              # The submodule is checked out on the host, but the container mounts
+              # the workspace with the submodule gitdir link pointing at a host path
+              # that does not exist here, and the cached image may carry a stale
+              # submodule url, so `git submodule update` can no-op and leave the
+              # working tree empty. Sync the url, force-update, and if the tree is
+              # still not materialized, clone the pinned commit directly (url + sha
+              # read from git metadata, so nothing is hardcoded). Fail loudly if the
+              # source is still missing rather than letting build.py raise later.
+              git config --global --add safe.directory '*' || true
+              git submodule sync third_party/libdrmtap || true
+              git submodule update --init --force third_party/libdrmtap || true
+              if [ ! -f third_party/libdrmtap/meson.build ]; then
+                echo "libdrmtap working tree not materialized in container; cloning it directly"
+                drmtap_url=$(git config -f .gitmodules submodule.third_party/libdrmtap.url)
+                drmtap_sha=$(git ls-tree HEAD third_party/libdrmtap | awk '{print $3}')
+                rm -rf third_party/libdrmtap
+                git clone "$drmtap_url" third_party/libdrmtap
+                git -C third_party/libdrmtap checkout "$drmtap_sha"
+              fi
+              test -f third_party/libdrmtap/meson.build || { echo "FATAL: libdrmtap source missing"; exit 1; }
               cargo build --locked --lib $JOBS --features hwcodec,flutter,unix-file-copy-paste,drm --release
               python3 ./build.py --flutter --drm --skip-cargo
               for name in rustdesk-unattended-wayland*??.deb; do
