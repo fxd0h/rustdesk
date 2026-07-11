@@ -178,19 +178,68 @@ async fn recv_thread(
                 }
                 Err(err) => break format!("frame body: {err}"),
             },
-            Ok(Some(Data::DrmCursor { .. })) => {
-                // Consume the paired cursor payload; cursor integration lands in P6.
-                let _ = conn.next_raw().await;
-            }
+            Ok(Some(Data::DrmCursor {
+                id,
+                width,
+                height,
+                hotx,
+                hoty,
+            })) => match conn.next_raw().await {
+                Ok(raw) => set_drm_cursor(DrmCursorData {
+                    id,
+                    width: width as i32,
+                    height: height as i32,
+                    hotx,
+                    hoty,
+                    colors: raw.to_vec(),
+                }),
+                Err(err) => break format!("cursor body: {err}"),
+            },
             Ok(Some(_)) => {} // ignore any unexpected control message
             Ok(None) => break "desynchronized frame".to_owned(),
             Err(err) => break format!("recv: {err}"),
         }
     };
     log::info!("drm capture stream ended: {end_reason}");
+    // Drop the last hardware-cursor snapshot so it does not linger after teardown.
+    clear_drm_cursor();
     let mut slot = shared.slot.lock().unwrap();
     slot.ended = Some(format!("drm stream ended ({end_reason})"));
     shared.cv.notify_one();
+}
+
+// The latest DRM hardware-cursor snapshot, published by recv_thread and read by the cursor service
+// (platform::linux::get_cursor / get_cursor_data). One global: the common case is a single active
+// DRM stream (see the one-consumer note); a multi-stream setup shares it, last writer wins.
+#[derive(Clone)]
+pub struct DrmCursorData {
+    pub id: u64,
+    pub width: i32,
+    pub height: i32,
+    pub hotx: i32,
+    pub hoty: i32,
+    pub colors: Vec<u8>,
+}
+
+static DRM_CURSOR: Mutex<Option<DrmCursorData>> = Mutex::new(None);
+
+fn set_drm_cursor(c: DrmCursorData) {
+    *DRM_CURSOR.lock().unwrap() = Some(c);
+}
+
+fn clear_drm_cursor() {
+    *DRM_CURSOR.lock().unwrap() = None;
+}
+
+/// The id of the latest DRM hardware cursor (None if no stream/cursor). The cursor service polls
+/// this to detect shape changes (a change triggers a `get_cursor_data` fetch).
+pub fn drm_cursor_id() -> Option<u64> {
+    DRM_CURSOR.lock().unwrap().as_ref().map(|c| c.id)
+}
+
+/// The latest DRM hardware-cursor snapshot (RGBA), or None.
+pub fn drm_cursor() -> Option<DrmCursorData> {
+    DRM_CURSOR.lock().unwrap().clone()
 }
 
 // ---------------------------------------------------------------------------
