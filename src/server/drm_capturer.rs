@@ -285,31 +285,29 @@ async fn query_displays_async() -> ResultType<Vec<DrmDisplayInfo>> {
 /// Whether the root service offers DRM/KMS capture. Probed once and cached (both the positive and
 /// negative result) until `clear()`.
 pub(super) fn is_available() -> bool {
-    {
-        let st = DRM_STATE.lock().unwrap();
-        match &*st {
-            ProbeState::Available(_) => return true,
-            ProbeState::Unavailable => return false,
-            ProbeState::Unknown => {}
-        }
-    }
-    // Probe with the lock released (bounded blocking IO); a concurrent double-probe is harmless.
-    let result = query_displays();
+    // Serialize the probe under the lock: the enumeration hooks all call this, and a burst of
+    // concurrent callers would otherwise open several racing `_drm` connections that contend on the
+    // single-consumer listener and can wrongly cache Unavailable. Holding the lock does one probe;
+    // it is fast (the listener is free before any capture starts) and the result is cached durably.
     let mut st = DRM_STATE.lock().unwrap();
-    match result {
-        Ok(list) if !list.is_empty() => {
-            *st = ProbeState::Available(list);
-            true
-        }
-        Ok(_) => {
-            *st = ProbeState::Unavailable;
-            false
-        }
-        Err(err) => {
-            log::debug!("drm capture not available: {err}");
-            *st = ProbeState::Unavailable;
-            false
-        }
+    match &*st {
+        ProbeState::Available(_) => true,
+        ProbeState::Unavailable => false,
+        ProbeState::Unknown => match query_displays() {
+            Ok(list) if !list.is_empty() => {
+                *st = ProbeState::Available(list);
+                true
+            }
+            Ok(_) => {
+                *st = ProbeState::Unavailable;
+                false
+            }
+            Err(err) => {
+                log::debug!("drm capture not available: {err}");
+                *st = ProbeState::Unavailable;
+                false
+            }
+        },
     }
 }
 

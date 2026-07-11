@@ -273,8 +273,10 @@ pub fn clear() {
     if is_x11() {
         return;
     }
-    #[cfg(feature = "drm")]
-    super::drm_capturer::clear();
+    // NOTE: intentionally do NOT reset the DRM probe cache here. `clear()` runs on every capturer
+    // teardown (which happens on each video-service restart), and re-probing `_drm` from the async
+    // enumeration path blocks the executor long enough to trip "deadline has elapsed" and spiral
+    // into a restart loop. DRM availability is fixed at service start, so the cache stays valid.
     let mut write_lock = CAP_DISPLAY_INFO.write().unwrap();
     for (_, addr) in write_lock.iter() {
         let cap_display_info: *mut CapDisplayInfo = *addr as _;
