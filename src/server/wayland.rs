@@ -109,11 +109,13 @@ struct CapDisplayInfo {
 
 /// Set the uinput absolute-pointer range to the whole logical desktop so the compositor maps
 /// injected coordinates 1:1 instead of stretching a single-monitor range across all outputs. The
-/// PipeWire path does this inside `check_init`; the DRM path must do it too (it bypasses check_init),
-/// otherwise on a multi-monitor host the injected pointer lands on the wrong output — and the
+/// PipeWire path does this inline in `check_init`; the DRM path bypasses check_init so it must do it
+/// too, otherwise on a multi-monitor host the injected pointer lands on the wrong output — and the
 /// hardware cursor, which lives on whichever CRTC the pointer is over, never appears on the captured
 /// CRTC (the "cursor not visible" symptom). Reads the layout from the Wayland outputs, so it is
-/// independent of the capture backend.
+/// independent of the capture backend. DRM-only: check_init keeps its own inline copy so the
+/// drm-off build stays byte-identical to upstream.
+#[cfg(feature = "drm")]
 async fn update_uinput_resolution() {
     if crate::input_service::wayland_use_uinput() {
         if let Some((minx, maxx, miny, maxy)) =
@@ -168,7 +170,24 @@ pub(super) fn is_inited() -> Option<Message> {
 pub(super) async fn check_init() -> ResultType<()> {
     if !is_x11() {
         if CAP_DISPLAY_INFO.read().unwrap().is_empty() {
-            update_uinput_resolution().await;
+            if crate::input_service::wayland_use_uinput() {
+                if let Some((minx, maxx, miny, maxy)) =
+                    scrap::wayland::display::get_desktop_rect_for_uinput()
+                {
+                    log::info!(
+                        "update mouse resolution: ({}, {}), ({}, {})",
+                        minx,
+                        maxx,
+                        miny,
+                        maxy
+                    );
+                    allow_err!(
+                        input_service::update_mouse_resolution(minx, maxx, miny, maxy).await
+                    );
+                } else {
+                    log::warn!("Failed to get desktop rect for uinput");
+                }
+            }
 
             let mut lock = CAP_DISPLAY_INFO.write().unwrap();
             if lock.is_empty() {
