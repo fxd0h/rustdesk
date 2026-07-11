@@ -1779,7 +1779,7 @@ fn drm_capture_worker(
     };
     // Refresh the cache from the live device so the next consumer's handshake uses fresh geometry.
     *DRM_DISPLAY_CACHE.lock().unwrap() = drm_displays_from_reader(&mut reader);
-    log::info!(
+    log::debug!(
         "drm: capture reader for crtc {target_crtc} opened in {:?}",
         t_open.elapsed()
     );
@@ -1793,7 +1793,7 @@ fn drm_capture_worker(
                 stalled = 0;
                 if !logged_first {
                     logged_first = true;
-                    log::info!(
+                    log::debug!(
                         "drm: first frame {w}x{h} for crtc {target_crtc} in {:?}",
                         t_conn.elapsed()
                     );

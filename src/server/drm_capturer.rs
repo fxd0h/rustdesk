@@ -331,7 +331,7 @@ pub(super) fn is_available() -> bool {
             let t = Instant::now();
             match query_displays() {
                 Ok(list) if !list.is_empty() => {
-                    log::info!(
+                    log::debug!(
                         "drm: availability probe -> available ({} displays) in {:?}",
                         list.len(),
                         t.elapsed()
