@@ -339,6 +339,16 @@ def build_libdrmtap_so():
     # target is built (the submodule also carries a helper binary we do not ship).
     # Returns the path to the built versioned .so (e.g. .../libdrmtap.so.0.4.4).
     repo_root = os.path.dirname(os.path.abspath(__file__))
+    # Allow a caller (e.g. CI) to build the .so ahead of time — while the submodule
+    # source is known to be present — and hand it in via DRMTAP_PREBUILT_DIR. This
+    # sidesteps environments where a later build step disturbs the submodule working
+    # tree before we get here. The dir must contain the real libdrmtap.so.0.* object.
+    prebuilt_dir = os.environ.get('DRMTAP_PREBUILT_DIR')
+    if prebuilt_dir:
+        prebuilt = [p for p in glob.glob(os.path.join(prebuilt_dir, 'libdrmtap.so.0.*'))
+                    if os.path.isfile(p) and not os.path.islink(p)]
+        if prebuilt:
+            return prebuilt[0]
     submodule = os.path.join(repo_root, 'third_party', 'libdrmtap')
     if not os.path.exists(os.path.join(submodule, 'meson.build')):
         raise Exception(
