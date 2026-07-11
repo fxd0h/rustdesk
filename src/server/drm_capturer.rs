@@ -15,6 +15,7 @@
 use crate::ipc::{connect_drm, Data, DrmDisplayInfo};
 use hbb_common::{anyhow::anyhow, log, message_proto::DisplayInfo, tokio, ResultType};
 use scrap::{Frame, Pixfmt, PixelBuffer, TraitCapturer};
+use std::collections::BTreeMap;
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -164,13 +165,22 @@ async fn recv_thread(
     }
     let _ = tx.send(Ok(displays));
 
-    // Stream until stopped or the connection ends.
+    // Stream until stopped or the connection ends. Poll the header read with a short timeout (rather
+    // than blocking indefinitely on `next()`) so a dropped capturer re-checks `stop` and tears down
+    // promptly even when the producer has stalled (no frames arriving). A header is always followed
+    // immediately by its `next_raw()` body, so only the header read needs the poll.
     let end_reason = loop {
         if stop.load(Ordering::SeqCst) {
             break "stopped".to_owned();
         }
-        match conn.next().await {
-            Ok(Some(Data::DrmFrame { width, height })) => match conn.next_raw().await {
+        let msg = match conn.next_timeout2(200).await {
+            None => continue, // timeout: re-check stop at the loop top
+            Some(Ok(Some(d))) => d,
+            Some(Ok(None)) => break "desynchronized frame".to_owned(),
+            Some(Err(err)) => break format!("recv: {err}"),
+        };
+        match msg {
+            Data::DrmFrame { width, height } => match conn.next_raw().await {
                 Ok(raw) => {
                     let mut slot = shared.slot.lock().unwrap();
                     slot.latest = Some((width as usize, height as usize, raw.to_vec()));
@@ -178,41 +188,44 @@ async fn recv_thread(
                 }
                 Err(err) => break format!("frame body: {err}"),
             },
-            Ok(Some(Data::DrmCursor {
+            Data::DrmCursor {
                 id,
                 width,
                 height,
                 hotx,
                 hoty,
-            })) => match conn.next_raw().await {
-                Ok(raw) => set_drm_cursor(DrmCursorData {
-                    id,
-                    width: width as i32,
-                    height: height as i32,
-                    hotx,
-                    hoty,
-                    colors: raw.to_vec(),
-                }),
+            } => match conn.next_raw().await {
+                Ok(raw) => set_drm_cursor(
+                    display,
+                    DrmCursorData {
+                        id,
+                        width: width as i32,
+                        height: height as i32,
+                        hotx,
+                        hoty,
+                        colors: raw.to_vec(),
+                    },
+                ),
                 Err(err) => break format!("cursor body: {err}"),
             },
-            Ok(Some(_)) => {} // ignore any unexpected control message
-            Ok(None) => break "desynchronized frame".to_owned(),
-            Err(err) => break format!("recv: {err}"),
+            _ => {} // ignore any unexpected control message
         }
     };
     log::info!("drm capture stream ended: {end_reason}");
-    // Drop the last hardware-cursor snapshot so it does not linger after teardown.
-    clear_drm_cursor();
+    // Drop only THIS stream's cursor entry so a torn-down monitor does not erase the cursor state of
+    // other still-active streams.
+    remove_drm_cursor(display);
     let mut slot = shared.slot.lock().unwrap();
     slot.ended = Some(format!("drm stream ended ({end_reason})"));
     shared.cv.notify_one();
 }
 
-// The latest DRM hardware-cursor snapshot, published by recv_thread and read by the cursor service
-// (platform::linux::get_cursor / get_cursor_data). One global shared by all active streams: a
-// multi-monitor client runs one recv_thread per display, and the hardware cursor lives on whichever
-// CRTC the pointer is over (the others report the hidden sentinel), so last-writer-wins here tracks
-// the pointer as it moves between monitors. Per-CRTC cursor routing is a later refinement.
+// The latest DRM hardware-cursor snapshots, published by recv_thread and read by the cursor service
+// (platform::linux::get_cursor / get_cursor_data). Keyed by display index because a multi-monitor
+// client runs one recv_thread per display and the hardware cursor lives on whichever CRTC the
+// pointer is over (the others report the hidden sentinel). Keying per stream — instead of a single
+// last-writer-wins global — stops one stream's hidden sentinel from clobbering another stream's
+// visible cursor, and lets a torn-down stream drop only its own entry.
 #[derive(Clone)]
 pub struct DrmCursorData {
     pub id: u64,
@@ -223,25 +236,36 @@ pub struct DrmCursorData {
     pub colors: Vec<u8>,
 }
 
-static DRM_CURSOR: Mutex<Option<DrmCursorData>> = Mutex::new(None);
+static DRM_CURSOR: Mutex<BTreeMap<i32, DrmCursorData>> = Mutex::new(BTreeMap::new());
 
-fn set_drm_cursor(c: DrmCursorData) {
-    *DRM_CURSOR.lock().unwrap() = Some(c);
+fn set_drm_cursor(display: i32, c: DrmCursorData) {
+    DRM_CURSOR.lock().unwrap().insert(display, c);
 }
 
-fn clear_drm_cursor() {
-    *DRM_CURSOR.lock().unwrap() = None;
+fn remove_drm_cursor(display: i32) {
+    DRM_CURSOR.lock().unwrap().remove(&display);
 }
 
-/// The id of the latest DRM hardware cursor (None if no stream/cursor). The cursor service polls
-/// this to detect shape changes (a change triggers a `get_cursor_data` fetch).
+// Pick the cursor to present: prefer the visible one (the pointer is over exactly one captured CRTC
+// at a time), else fall back to any (hidden) entry so the client still gets the hidden sentinel when
+// the pointer is off every captured monitor. `None` only when no stream is active.
+fn pick_drm_cursor() -> Option<DrmCursorData> {
+    let map = DRM_CURSOR.lock().unwrap();
+    map.values()
+        .find(|c| c.id != scrap::drm_reader::HIDDEN_CURSOR_ID)
+        .or_else(|| map.values().next())
+        .cloned()
+}
+
+/// The id of the current DRM hardware cursor (None if no stream). The cursor service polls this to
+/// detect shape changes (a change triggers a `get_cursor_data` fetch).
 pub fn drm_cursor_id() -> Option<u64> {
-    DRM_CURSOR.lock().unwrap().as_ref().map(|c| c.id)
+    pick_drm_cursor().map(|c| c.id)
 }
 
-/// The latest DRM hardware-cursor snapshot (RGBA), or None.
+/// The current DRM hardware-cursor snapshot (RGBA), or None.
 pub fn drm_cursor() -> Option<DrmCursorData> {
-    DRM_CURSOR.lock().unwrap().clone()
+    pick_drm_cursor()
 }
 
 // ---------------------------------------------------------------------------
