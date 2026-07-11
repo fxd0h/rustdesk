@@ -428,7 +428,7 @@ def build_flutter_deb(version, features):
     system2('mkdir -p tmpdeb/DEBIAN')
     # libdrmtap's runtime deps (libdrm / EGL / GLESv2); the .so fails to dlopen and
     # the capture falls back to PipeWire without them, so make them hard deps.
-    drm_depends = ", libdrm2, libegl1, libgles2" if ships_so else ""
+    drm_depends = ", libdrm2, libegl1, libgles2, libva2, libva-drm2" if ships_so else ""
     generate_control_file(version, drm_depends, package_name)
     system2('cp -a ../res/DEBIAN/* tmpdeb/DEBIAN/')
     if ships_so:
@@ -487,7 +487,7 @@ def build_deb_from_folder(version, binary_folder):
     # A staged bundle carrying the .so is the DRM package: name it accordingly
     # (Conflicts/Replaces/Provides rustdesk) and add libdrmtap's runtime deps.
     package_name = 'rustdesk-unattended-wayland' if ships_so else 'rustdesk'
-    drm_depends = ", libdrm2, libegl1, libgles2" if ships_so else ""
+    drm_depends = ", libdrm2, libegl1, libgles2, libva2, libva-drm2" if ships_so else ""
     generate_control_file(version, drm_depends, package_name)
     system2('cp -a ../res/DEBIAN/* tmpdeb/DEBIAN/')
     if ships_so:

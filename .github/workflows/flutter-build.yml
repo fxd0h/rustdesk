@@ -1687,8 +1687,13 @@ jobs:
               echo -e "start packaging unattended-wayland (DRM) deb"
               # drm-only build deps (meson builds libdrmtap.so from the submodule),
               # installed here — not in the stock install list — so the default
-              # drm-off build stays identical to upstream
-              apt-get install -y meson ninja-build libdrm-dev libegl-dev libgles-dev
+              # drm-off build stays identical to upstream. libdrmtap's meson.build
+              # needs meson >= 0.57 (fs.read) + `meson compile` (>= 0.54); the distro
+              # apt meson is far older on the 18.04 build container, so install it via
+              # pip (pinned < 0.62 for the container's python 3.6).
+              apt-get install -y ninja-build libdrm-dev libegl-dev libgles-dev python3-pip
+              python3 -m pip install --upgrade pip
+              python3 -m pip install 'meson>=0.57,<0.62'
               git submodule update --init third_party/libdrmtap
               cargo build --locked --lib $JOBS --features hwcodec,flutter,unix-file-copy-paste,drm --release
               python3 ./build.py --flutter --drm --skip-cargo
