@@ -113,6 +113,13 @@ pub struct DrmtapLib {
 unsafe impl Send for DrmtapLib {}
 unsafe impl Sync for DrmtapLib {}
 
+// The #[repr(C)] struct layouts above track libdrmtap's ABI *major* version,
+// which in turn tracks the `.so.0` soname. drmtap_version() packs the semver as
+// (major << 16) | (minor << 8) | patch. A major mismatch means the structs may
+// be laid out differently, so we refuse the library rather than read through a
+// mismatched layout. Minor/patch bumps are additive and remain compatible.
+const DRMTAP_ABI_MAJOR: c_int = 0;
+
 impl DrmtapLib {
     fn load() -> Option<Self> {
         // soname first (what a packaged .so installs), then the dev symlink.
@@ -124,9 +131,21 @@ impl DrmtapLib {
             // every symbol is required; a missing one means an incompatible .so,
             // so bail to None and let the caller fall back to PipeWire.
             let version: FnVersion = *lib.get(b"drmtap_version").ok()?;
-            // Call it once as a load-time smoke check (confirms the .so responds
-            // through the resolved entry point) and record the ABI version.
-            log::info!("libdrmtap loaded: {name} (abi version {})", version());
+            // Call it once at load time: this smoke-checks that the .so responds
+            // through the resolved entry point *and* lets us reject a rebuilt
+            // library whose ABI (struct layout) no longer matches the #[repr(C)]
+            // definitions above. Resolving symbols alone would not catch that.
+            let v = version();
+            let (major, minor, patch) = ((v >> 16) & 0xff, (v >> 8) & 0xff, v & 0xff);
+            if major != DRMTAP_ABI_MAJOR {
+                log::warn!(
+                    "libdrmtap {name} reports ABI major {major} (v{major}.{minor}.{patch}), \
+                     expected {DRMTAP_ABI_MAJOR}; refusing to load to avoid struct-layout \
+                     mismatch (falling back to PipeWire/portal)"
+                );
+                return None;
+            }
+            log::info!("libdrmtap loaded: {name} (v{major}.{minor}.{patch})");
             let open: FnOpen = *lib.get(b"drmtap_open").ok()?;
             let close: FnClose = *lib.get(b"drmtap_close").ok()?;
             let list_displays: FnListDisplays = *lib.get(b"drmtap_list_displays").ok()?;
