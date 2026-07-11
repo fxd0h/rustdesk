@@ -8,62 +8,83 @@ portal prompt is not acceptable. Because it bypasses consent, treat it as a
 
 ## How it works
 
-Capture needs DRM master / `CAP_SYS_ADMIN` to read other clients' framebuffers.
-Rather than run RustDesk as root, the `drm` feature ships a small privileged
-helper, **`drmtap-helper`** (from
-[`libdrmtap-sys`](https://crates.io/crates/libdrmtap-sys)), which carries
-`cap_sys_admin+ep` via file capabilities and talks to the unprivileged RustDesk
-process over a `socketpair`, passing the scanout back as a DMA-BUF fd.
+Reading the active scanout needs `CAP_SYS_ADMIN` (to map other clients'
+framebuffers). RustDesk's root `--service` already runs with `CAP_SYS_ADMIN`, so
+the `drm` feature does the read **in-process in that root service**: it
+`dlopen`s `libdrmtap.so` and calls it in direct mode — no privileged child, no
+`setcap` helper. Captured frames are copied to packed BGRA and streamed to the
+unprivileged user `--server` over a dedicated service-scoped IPC channel
+(`_drm`), which feeds them to the encoder. This mirrors the Windows
+`portable_service` split (a privileged process captures, an unprivileged one
+presents) but reuses RustDesk's own hardened IPC.
+
+- `libdrmtap.so` is loaded through a small `dlopen` loader (`drmtap_dl`); if the
+  library or one of its runtime deps is missing the load fails cleanly and the
+  caller falls back to the PipeWire/portal path.
+- The reader restricts the device it opens to a realpath under `/dev/dri/`
+  (`drm_reader.rs`); the `libdrmtap` `helper_path` is `NULL`, so no helper is
+  ever spawned (direct in-process mode).
+- `libdrmtap` is a general-purpose library and still provides a privileged
+  `drmtap-helper` mode (a `cap_sys_admin` helper that passes frames over a
+  `socketpair`) for consumers that are **not** already root. RustDesk does not
+  build, ship, or use that helper — its `--service` already holds
+  `CAP_SYS_ADMIN`, so it reads in-process (direct mode). The helper path remains
+  available in the library for other software that needs it.
+- The `_drm` socket lives beside the hardened `_service` socket
+  (`/tmp/<app>-service/ipc_drm`). It is `0666` so the unprivileged `--server`
+  can connect, but every accepted peer is authorized in `handle_drm_conn`
+  (`authorize_service_scoped_ipc_connection`: peer must be root or the active
+  session uid, with a `/proc/<pid>/exe` identity match). Connectable is not
+  authorized.
 
 ## Threat model
 
 - **Consent bypass.** This mode does not show the portal "select what to share"
   prompt. On a misconfigured install it could expose the login screen, the lock
   screen, or another local user's graphical session.
-- **The TCB is `drmtap-helper` / `libdrmtap-sys`.** The privileged behaviour
-  (caller authentication, IPC parsing, seccomp, DRM access, framebuffer bounds
-  checks) lives there and has been security-reviewed. It is hardened:
-  - validates it was spawned by the library (inherited socket on fd 3) **and**
-    checks the peer UID via `SO_PEERCRED`;
-  - restricts the device it opens to a realpath under `/dev/dri/`, opened
-    `O_RDONLY`;
-  - `PR_SET_NO_NEW_PRIVS`, drops all capabilities except `CAP_SYS_ADMIN`, then
-    installs a **default-KILL seccomp allowlist** that deliberately forbids
-    `open`/`openat` (the device is opened once before the filter loads), so a
-    compromised helper cannot open arbitrary files even with `CAP_SYS_ADMIN`;
-  - built with stack-protector-strong, FORTIFY, PIE and full RELRO;
-  - integer-overflow / DoS size guards on the framebuffer geometry.
-- **`CAP_SYS_ADMIN` is broad.** The helper is deliberately tiny and confined as
-  above, but any unfound bug in it is a local-privilege concern — hence the
-  access-controlled install below.
+- **The scanout parse runs in the root service.** Moving the read in-process
+  removes the old `setcap` helper and its world-exec / DMA-BUF-fd-passing attack
+  surface, but it also means the pixel-format conversion / detile of an
+  untrusted framebuffer runs inside the `CAP_SYS_ADMIN` service, without a
+  seccomp cage around it. Mitigations: the device is realpath-gated to
+  `/dev/dri/`; the frame copy has format / stride / geometry and
+  integer-overflow guards (`drm_reader.rs`); non-32bpp scanouts are rejected
+  before the copy.
+- **`_drm` is a screen-content channel.** It is authorized per connection (see
+  above); without that authz any local process could read the screen. There is
+  no fd passing and no shared memory — frames cross as plain bytes over the
+  authorized socket.
 
 ## Deployment
 
 - **Off by default.** The `drm` feature is **not** in the default feature set and
-  is **not** enabled in standard release packages. Build it explicitly with
+  is **not** enabled in standard release packages; the drm-off build is
+  byte-identical to upstream. Build it explicitly with
   `python3 build.py --flutter --drm` (Linux only).
-- **Not world-executable.** The `.deb` postinst installs the helper as:
+- **Separate opt-in package.** A `--drm` build ships as a distinctly named
+  `rustdesk-unattended-wayland` package (Conflicts/Replaces `rustdesk`), so
+  enabling consent-free capture is an explicit install choice.
+- **Bundled library, no capabilities.** The package installs `libdrmtap.so.0`
+  under `/usr/lib/rustdesk/` and registers that directory with the dynamic
+  linker so the in-process `dlopen("libdrmtap.so.0")` resolves:
 
   ```bash
-  groupadd -r rustdesk-capture
-  chown root:rustdesk-capture /usr/lib/rustdesk/drmtap-helper
-  chmod 0750 /usr/lib/rustdesk/drmtap-helper
-  setcap cap_sys_admin+ep /usr/lib/rustdesk/drmtap-helper
+  # /etc/ld.so.conf.d/rustdesk-unattended-wayland.conf contains /usr/lib/rustdesk
+  ldconfig
   ```
 
-  Only members of `rustdesk-capture` can run it; an administrator opts users in
-  with `usermod -aG rustdesk-capture <user>`. Everyone else (and every host
-  where the group is empty) transparently falls back to the PipeWire/portal
-  path. There is no window where the binary is both `0755` and capability-bearing
-  (mode/owner are set before `setcap`).
+  There is no `setcap`, no `rustdesk-capture` group, and no privileged binary:
+  the capture runs inside the root `--service`, which already holds the
+  capability it needs. Hosts without `/dev/dri` access (or where the library
+  fails to load) transparently fall back to the PipeWire/portal path.
 - **Recommended for** single-user, physically-controlled, or unattended hosts.
-  On shared/multi-user hosts, only add trusted operators to `rustdesk-capture`;
-  the group is the access-control boundary.
 
 ## Auditing
 
 ```bash
-getcap /usr/lib/rustdesk/drmtap-helper      # expect: cap_sys_admin=ep
-getfacl /usr/lib/rustdesk/drmtap-helper     # expect: root:rustdesk-capture 0750
-setcap -r /usr/lib/rustdesk/drmtap-helper   # revoke the capability
+# the bundled capture library — no capabilities are set on it
+ls -l /usr/lib/rustdesk/libdrmtap.so.0
+cat /etc/ld.so.conf.d/rustdesk-unattended-wayland.conf   # expect: /usr/lib/rustdesk
+# confirm no privileged helper is present (there should be none)
+getcap -r /usr/lib/rustdesk 2>/dev/null                  # expect: no output
 ```

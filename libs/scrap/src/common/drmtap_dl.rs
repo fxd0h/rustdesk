@@ -121,10 +121,12 @@ impl DrmtapLib {
             let (lib, name) = LIB_NAMES
                 .iter()
                 .find_map(|n| Library::new(n).ok().map(|l| (l, *n)))?;
-            log::info!("libdrmtap loaded: {name}");
             // every symbol is required; a missing one means an incompatible .so,
             // so bail to None and let the caller fall back to PipeWire.
             let version: FnVersion = *lib.get(b"drmtap_version").ok()?;
+            // Call it once as a load-time smoke check (confirms the .so responds
+            // through the resolved entry point) and record the ABI version.
+            log::info!("libdrmtap loaded: {name} (abi version {})", version());
             let open: FnOpen = *lib.get(b"drmtap_open").ok()?;
             let close: FnClose = *lib.get(b"drmtap_close").ok()?;
             let list_displays: FnListDisplays = *lib.get(b"drmtap_list_displays").ok()?;
