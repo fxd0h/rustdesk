@@ -401,6 +401,13 @@ fn run_cursor(sp: MouseCursorService, state: &mut StateCursor) -> ResultType<()>
                 msg = cached.clone();
             } else {
                 let mut data = crate::get_cursor_data(hcursor)?;
+                // On the DRM path get_cursor_data() may return a snapshot whose id has advanced past
+                // the requested `hcursor` (it returns the latest hardware cursor). File it in the
+                // cache under the id actually returned so a later reappearance of that exact shape is
+                // a correct hit, instead of replaying whatever newer image was cached under `hcursor`.
+                // On every other path data.id == hcursor, so this shadow is a no-op there.
+                #[cfg(feature = "drm")]
+                let hcursor = data.id;
                 data.colors = hbb_common::compress::compress(&data.colors[..]).into();
                 let mut tmp = Message::new();
                 tmp.set_cursor_data(data);

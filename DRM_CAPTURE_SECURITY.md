@@ -77,6 +77,12 @@ presents) but reuses RustDesk's own hardened IPC.
   the capture runs inside the root `--service`, which already holds the
   capability it needs. Hosts without `/dev/dri` access (or where the library
   fails to load) transparently fall back to the PipeWire/portal path.
+- **Minimum OS: Ubuntu 18.04 (or equivalent, libdrm ≥ 2.4.95).** `libdrmtap` needs the DRM
+  `GetFB2` framebuffer API (libdrm 2.4.95); Ubuntu 18.04 ships 2.4.101, so 18.04 is the floor. The
+  `rustdesk-unattended-wayland` deb is built and CI-tested on an ubuntu18.04 container, so it runs on
+  18.04 and newer. Capture also requires an active KMS scanout (a Wayland/KMS session with a display
+  on); on hosts where the compositor drives the display outside DRM/KMS (e.g. the proprietary NVIDIA
+  X11 stack) there is no capturable CRTC and the path falls back to PipeWire/portal.
 - **Recommended for** single-user, physically-controlled, or unattended hosts.
 
 ## Auditing

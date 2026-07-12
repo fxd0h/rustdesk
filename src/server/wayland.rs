@@ -275,10 +275,11 @@ pub(super) async fn get_displays() -> ResultType<Vec<DisplayInfo>> {
 }
 
 pub(super) fn get_primary() -> ResultType<usize> {
-    // DRM/KMS first cut streams the primary; multi-monitor selection lands in P6.
+    // DRM connector order is not the compositor's primary; resolve the real primary from the
+    // compositor layout (matched by normalized connector name) instead of hardcoding index 0.
     #[cfg(feature = "drm")]
     if super::drm_capturer::is_available() {
-        return Ok(0);
+        return Ok(super::drm_capturer::get_primary_index());
     }
     let cap_map = CAP_DISPLAY_INFO.read().unwrap();
     if let Some(addr) = cap_map.values().next() {
@@ -295,6 +296,15 @@ pub(super) fn get_primary() -> ResultType<usize> {
 pub fn clear() {
     if is_x11() {
         return;
+    }
+    // The DRM path augments its geometry from the compositor's Wayland outputs (logical origin +
+    // scale), which scrap caches process-wide. The PipeWire path clears that cache on session close,
+    // but the DRM path opens no PipeWire session, so without this it would keep matching DRM outputs
+    // against STALE geometry after a monitor hotplug/rotation/scale change. Invalidate it on teardown
+    // so the next session re-reads fresh geometry (lazily, on the next enumeration) and self-heals.
+    #[cfg(feature = "drm")]
+    if super::drm_capturer::is_available() {
+        scrap::wayland::display::clear_wayland_displays_cache();
     }
     // NOTE: intentionally do NOT reset the DRM probe cache here. `clear()` runs on every capturer
     // teardown (which happens on each video-service restart), and re-probing `_drm` from the async

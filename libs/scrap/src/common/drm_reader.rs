@@ -157,6 +157,27 @@ impl DrmReader {
                     "unsupported DRM scanout format",
                 ));
             }
+            // Byte-order guard: libdrmtap normalizes the scanout to a BGRA-compatible 32-bit layout
+            // (XRGB/ARGB8888 = little-endian B,G,R,{X,A} in memory). A different 32-bit order such as
+            // XBGR8888 passes the stride check above but, labeled BGRA downstream, would ship with red
+            // and blue swapped — so reject any fourcc we cannot present as BGRA. A zero/unknown fourcc
+            // falls through to the stride invariant (kept for libdrmtap builds that do not set it).
+            const DRM_FORMAT_XRGB8888: u32 = 0x3432_5258; // 'XR24'
+            const DRM_FORMAT_ARGB8888: u32 = 0x3432_5241; // 'AR24'
+            if frame.format != 0
+                && frame.format != DRM_FORMAT_XRGB8888
+                && frame.format != DRM_FORMAT_ARGB8888
+            {
+                log::warn!(
+                    "DRM scanout fourcc {:#010x} is not BGRA-compatible; falling back",
+                    frame.format
+                );
+                (self.lib.frame_release)(self.ctx, &mut frame);
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "unsupported DRM scanout format",
+                ));
+            }
             let (w, h) = (w as usize, h as usize);
             let frame_size = w * 4 * h;
             if self.buf.len() != frame_size {

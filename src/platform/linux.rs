@@ -415,7 +415,7 @@ pub fn get_cursor_data(hcursor: u64) -> ResultType<CursorData> {
                         cd.width = (*img).width as _;
                         cd.height = (*img).height as _;
                         // to-do: how about if it is 0
-                        cd.id = (*img).cursor_serial as u64;
+                        cd.id = (*img).cursor_serial as _;
                         let pixels =
                             std::slice::from_raw_parts((*img).pixels, (cd.width * cd.height) as _);
                         // cd.colors.resize(pixels.len() * 4, 0);

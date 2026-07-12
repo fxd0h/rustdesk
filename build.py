@@ -333,7 +333,7 @@ def ffi_bindgen_function_refactor():
 
 
 def build_libdrmtap_so():
-    # Build libdrmtap.so from the pinned rustdesk-org/libdrmtap submodule via meson.
+    # Build libdrmtap.so from the pinned third_party/libdrmtap submodule via meson.
     # The pivot dlopen-s this .so in-process in the root service (which already holds
     # CAP_SYS_ADMIN) — no setcap helper, no privileged child. Only the shared library
     # target is built (the submodule also carries a helper binary we do not ship).

@@ -162,7 +162,7 @@ fn try_gdbus_primary() -> Option<String> {
     None
 }
 
-pub(crate) fn get_primary_monitor() -> Option<String> {
+fn get_primary_monitor() -> Option<String> {
     try_xrandr_primary()
         .or_else(try_kscreen_primary)
         .or_else(try_gdbus_primary)

@@ -45,7 +45,18 @@ pub struct IpcDrmCapturer {
     cur: Vec<u8>,
     cur_w: usize,
     cur_h: usize,
+    // Whether this capturer ever delivered a frame. Used to distinguish a stream that fails to
+    // produce ANY frame (a permanent grab failure — unsupported scanout on every CRTC) from a normal
+    // teardown, so DRM can eventually fall back to PipeWire instead of rebuilding onto DRM forever.
+    got_frame: bool,
 }
+
+// Consecutive DRM capture sessions that ended without ever producing a frame. A permanent grab
+// failure (e.g. an unsupported scanout format on every CRTC) enumerates fine but never grabs, so the
+// video service would keep rebuilding onto DRM. After this many zero-frame failures in a row we mark
+// DRM unavailable so capture settles on PipeWire/portal; any session that produces a frame resets it.
+static DRM_GRAB_FAILURES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+const DRM_GRAB_MAX_FAILURES: u32 = 4;
 
 impl IpcDrmCapturer {
     /// Connect to the service `_drm` channel, complete the handshake (receive the display list, then
@@ -77,6 +88,7 @@ impl IpcDrmCapturer {
                 cur: Vec::new(),
                 cur_w: 0,
                 cur_h: 0,
+                got_frame: false,
             },
             displays,
         ))
@@ -113,11 +125,28 @@ impl TraitCapturer for IpcDrmCapturer {
                 self.cur = buf;
                 self.cur_w = w;
                 self.cur_h = h;
+                if !self.got_frame {
+                    // First frame of this session: DRM capture works here, clear the failure streak.
+                    self.got_frame = true;
+                    DRM_GRAB_FAILURES.store(0, Ordering::Relaxed);
+                }
             } else {
                 let err = slot
                     .ended
                     .clone()
                     .unwrap_or_else(|| "drm stream ended".to_owned());
+                if !self.got_frame {
+                    // This session never produced a frame. If enough sessions in a row fail this way,
+                    // DRM is effectively unusable on this host — disable it so capture falls back to
+                    // PipeWire/portal instead of rebuilding onto DRM forever.
+                    let n = DRM_GRAB_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n >= DRM_GRAB_MAX_FAILURES {
+                        log::warn!(
+                            "drm: {n} capture sessions produced no frame; disabling DRM (fall back to PipeWire)"
+                        );
+                        *DRM_STATE.lock().unwrap() = ProbeState::Unavailable;
+                    }
+                }
                 return Err(io::Error::new(io::ErrorKind::Other, err));
             }
         }
@@ -393,6 +422,26 @@ pub(super) fn get_display_infos() -> Option<Vec<DisplayInfo>> {
         _ => return None,
     };
     Some(augment_with_wayland_geometry(&list))
+}
+
+/// Index (into the cached DRM display list) of the compositor's PRIMARY output. DRM connector order
+/// is not the compositor's primary, so match the compositor's primary (from the same Wayland source
+/// the geometry augmentation uses) to the DRM list by normalized connector name; fall back to 0 when
+/// unknown. Without this the first DRM connector is always streamed, which is the wrong initial
+/// display whenever the primary is not connector 0.
+pub(super) fn get_primary_index() -> usize {
+    let list = match &*DRM_STATE.lock().unwrap() {
+        ProbeState::Available(list) => list.clone(),
+        _ => return 0,
+    };
+    let wl = scrap::wayland::display::get_displays();
+    if let Some(pw) = wl.displays.get(wl.primary) {
+        let pn = normalize_connector(&pw.name);
+        if let Some(idx) = list.iter().position(|d| normalize_connector(&d.name) == pn) {
+            return idx;
+        }
+    }
+    0
 }
 
 /// The DRM enumeration reports every monitor at physical size and origin (0,0) — it deliberately
