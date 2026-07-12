@@ -42,20 +42,25 @@ pub struct IpcDrmCapturer {
     stop: Arc<AtomicBool>,
     // The buffer `frame()` hands out a borrow of; kept across calls (grow-once) and only replaced
     // when a new frame is taken from the slot.
+    // The requested display index this capturer streams, for per-display failure tracking.
+    display: i32,
     cur: Vec<u8>,
     cur_w: usize,
     cur_h: usize,
     // Whether this capturer ever delivered a frame. Used to distinguish a stream that fails to
-    // produce ANY frame (a permanent grab failure — unsupported scanout on every CRTC) from a normal
-    // teardown, so DRM can eventually fall back to PipeWire instead of rebuilding onto DRM forever.
+    // produce ANY frame (a permanent grab failure — unsupported scanout on that CRTC) from a normal
+    // teardown, so DRM can fall back to PipeWire for that display instead of rebuilding it forever.
     got_frame: bool,
 }
 
-// Consecutive DRM capture sessions that ended without ever producing a frame. A permanent grab
-// failure (e.g. an unsupported scanout format on every CRTC) enumerates fine but never grabs, so the
-// video service would keep rebuilding onto DRM. After this many zero-frame failures in a row we mark
-// DRM unavailable so capture settles on PipeWire/portal; any session that produces a frame resets it.
-static DRM_GRAB_FAILURES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+// Consecutive DRM capture sessions, keyed BY requested display index, that ended without ever
+// producing a frame. A display whose scanout can never be grabbed (e.g. an unsupported format on its
+// CRTC) enumerates fine but never streams, so the video service would keep rebuilding it onto DRM.
+// Tracking this per display — not globally — stops a working monitor from masking a permanently
+// failing one: after DRM_GRAB_MAX_FAILURES consecutive zero-frame sessions for a given display,
+// get_capturer_info() refuses it so the video service falls back to PipeWire for THAT display; any
+// session that produces a frame clears that display's entry.
+static DRM_DISPLAY_FAILURES: Mutex<BTreeMap<i32, u32>> = Mutex::new(BTreeMap::new());
 const DRM_GRAB_MAX_FAILURES: u32 = 4;
 
 impl IpcDrmCapturer {
@@ -85,6 +90,7 @@ impl IpcDrmCapturer {
             IpcDrmCapturer {
                 shared,
                 stop,
+                display,
                 cur: Vec::new(),
                 cur_w: 0,
                 cur_h: 0,
@@ -126,9 +132,10 @@ impl TraitCapturer for IpcDrmCapturer {
                 self.cur_w = w;
                 self.cur_h = h;
                 if !self.got_frame {
-                    // First frame of this session: DRM capture works here, clear the failure streak.
+                    // First frame of this session: DRM capture works for this display, clear its
+                    // failure streak.
                     self.got_frame = true;
-                    DRM_GRAB_FAILURES.store(0, Ordering::Relaxed);
+                    DRM_DISPLAY_FAILURES.lock().unwrap().remove(&self.display);
                 }
             } else {
                 let err = slot
@@ -136,15 +143,19 @@ impl TraitCapturer for IpcDrmCapturer {
                     .clone()
                     .unwrap_or_else(|| "drm stream ended".to_owned());
                 if !self.got_frame {
-                    // This session never produced a frame. If enough sessions in a row fail this way,
-                    // DRM is effectively unusable on this host — disable it so capture falls back to
-                    // PipeWire/portal instead of rebuilding onto DRM forever.
-                    let n = DRM_GRAB_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
-                    if n >= DRM_GRAB_MAX_FAILURES {
+                    // This session never produced a frame for THIS display. If enough sessions in a
+                    // row fail this way for the same display, its scanout is effectively ungrababble;
+                    // count it so get_capturer_info() will refuse that display and the video service
+                    // falls back to PipeWire for it (other displays are unaffected).
+                    let mut map = DRM_DISPLAY_FAILURES.lock().unwrap();
+                    let n = map.entry(self.display).or_insert(0);
+                    *n += 1;
+                    if *n >= DRM_GRAB_MAX_FAILURES {
                         log::warn!(
-                            "drm: {n} capture sessions produced no frame; disabling DRM (fall back to PipeWire)"
+                            "drm: display {} produced no frame in {} sessions; falling back to PipeWire for it",
+                            self.display,
+                            *n
                         );
-                        *DRM_STATE.lock().unwrap() = ProbeState::Unavailable;
                     }
                 }
                 return Err(io::Error::new(io::ErrorKind::Other, err));
@@ -539,6 +550,21 @@ fn display_info_from_drm(d: &DrmDisplayInfo) -> DisplayInfo {
 pub(super) fn get_capturer_info(
     display_idx: usize,
 ) -> ResultType<super::video_service::CapturerInfo> {
+    // Refuse a display whose DRM scanout has repeatedly failed to grab, so the video service falls
+    // back to PipeWire for it instead of rebuilding it onto DRM forever. Other displays are unaffected
+    // (this is per-display, not a global DRM disable).
+    if DRM_DISPLAY_FAILURES
+        .lock()
+        .unwrap()
+        .get(&(display_idx as i32))
+        .copied()
+        .unwrap_or(0)
+        >= DRM_GRAB_MAX_FAILURES
+    {
+        return Err(anyhow!(
+            "drm capture for display {display_idx} repeatedly produced no frame; using PipeWire"
+        ));
+    }
     let (capturer, displays) = IpcDrmCapturer::new(display_idx as i32)?;
     let ndisplay = displays.len();
     let d = displays
