@@ -337,7 +337,7 @@ def build_libdrmtap_so():
     # The pivot dlopen-s this .so in-process in the root service (which already holds
     # CAP_SYS_ADMIN) — no setcap helper, no privileged child. Only the shared library
     # target is built (the submodule also carries a helper binary we do not ship).
-    # Returns the path to the built versioned .so (e.g. .../libdrmtap.so.0.4.4).
+    # Returns the path to the built versioned .so (e.g. .../libdrmtap.so.0.4.x).
     repo_root = os.path.dirname(os.path.abspath(__file__))
     # Allow a caller (e.g. CI) to build the .so ahead of time — while the submodule
     # source is known to be present — and hand it in via DRMTAP_PREBUILT_DIR. This
@@ -359,7 +359,7 @@ def build_libdrmtap_so():
     # Build only the shared library target ('drmtap'), not the bundled helper binary.
     system2(f'meson compile -C {build_dir} drmtap')
     sos = glob.glob(os.path.join(build_dir, 'libdrmtap.so.0.*'))
-    # keep the real object (libdrmtap.so.0.4.4), not the .so/.so.0 symlinks or meson's .p dir
+    # keep the real object (libdrmtap.so.0.4.x), not the .so/.so.0 symlinks or meson's .p dir
     sos = [p for p in sos if os.path.isfile(p) and not os.path.islink(p)]
     if not sos:
         raise Exception('libdrmtap build produced no libdrmtap.so.0.* object')
