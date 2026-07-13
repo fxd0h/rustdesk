@@ -1,6 +1,3 @@
 [submodule "libs/hbb_common"]
 	path = libs/hbb_common
 	url = https://github.com/rustdesk/hbb_common
-[submodule "third_party/libdrmtap"]
-	path = third_party/libdrmtap
-	url = https://github.com/fxd0h/libdrmtap
