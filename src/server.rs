@@ -754,11 +754,20 @@ async fn sync_and_watch_config_dir(sync_done_tx: Option<tokio::sync::oneshot::Se
                                             log::info!("sync config2 from root");
                                         }
                                     } else {
-                                        // only on macos, because this issue was only reproduced on macos
-                                        #[cfg(target_os = "macos")]
+                                        // Root config is empty: mark for sync in watch loop to
+                                        // prevent root from generating a new config on login screen.
+                                        // Otherwise root mints its own identity with no permanent
+                                        // password, and the next time this user server starts it
+                                        // adopts that config -- silently changing the id and dropping
+                                        // the password (Config::set replaces the config wholesale).
+                                        // This was originally guarded on macOS only, but nothing in
+                                        // it is macOS-specific and the same loss reproduces on Linux.
+                                        // The condition stays is_empty(), i.e. no id/enc_id or no key
+                                        // pair, so a root config that merely has its permanent
+                                        // password cleared is untouched and a deliberate password
+                                        // removal is never undone.
+                                        #[cfg(any(target_os = "macos", target_os = "linux"))]
                                         {
-                                            // root config is empty, mark for sync in watch loop
-                                            // to prevent root from generating a new config on login screen
                                             is_root_config_empty = true;
                                         }
                                     }
