@@ -158,29 +158,38 @@ pub(super) async fn update_uinput_resolution() {
     if !crate::input_service::wayland_use_uinput() {
         return;
     }
-    scrap::wayland::display::clear_wayland_displays_cache();
-    let rect = match scrap::wayland::display::get_desktop_rect_for_uinput() {
-        Some(rect) => rect,
-        None => {
-            // At a LOGIN SCREEN the Wayland enumerator has nothing to answer with, and not by
-            // accident: `Desktop::refresh` starts the greeter's `--server` with the compositor
-            // variables deliberately blank, because the DRM path talks to the root service and a
-            // render node and never to the compositor -- which is the entire reason it works
-            // there. So `get_desktop_rect_for_uinput` reads the compositor and finds nothing, and
-            // the uinput mouse was left on its default range: measured at an sddm greeter, a
-            // 2880x1800 panel got (0,1920)x(0,1080) and the pointer landed nowhere near where it
-            // was aimed, so the password field could not even be clicked.
-            //
-            // Take the rect from the displays the DRM path enumerated itself. They are the same
-            // displays being captured, so the coordinate space matches by construction.
-            let Some(rect) = drm_desktop_rect_for_uinput() else {
+    // At a LOGIN SCREEN the Wayland enumerator has nothing to answer with, and not by accident:
+    // `Desktop::refresh` starts the greeter's `--server` with the compositor variables deliberately
+    // blank, because the DRM path talks to the root service and a render node and never to the
+    // compositor -- which is the entire reason it works there. So `get_desktop_rect_for_uinput`
+    // reads the compositor, finds nothing, and the uinput mouse was left on its default range:
+    // measured at an sddm greeter, a 2880x1800 panel got (0,1920)x(0,1080) and the pointer landed
+    // nowhere near where it was aimed, so the password field could not even be clicked.
+    //
+    // Take the rect from the displays the DRM path enumerated itself. They are the same displays
+    // being captured, so the coordinate space matches by construction -- and ask for it FIRST here,
+    // rather than letting the compositor query fail on its way to the same answer.
+    let rect = if crate::platform::linux::is_login_screen_wayland_cached() {
+        let Some(rect) = drm_desktop_rect_for_uinput() else {
+            log::warn!("Failed to get desktop rect for uinput");
+            return;
+        };
+        log::info!(
+            "uinput desktop rect taken from the DRM display list (no compositor here): {rect:?}"
+        );
+        rect
+    } else {
+        scrap::wayland::display::clear_wayland_displays_cache();
+        // Still fall back on a session that is not a greeter: the enumerator can also come back
+        // empty on a compositor that answers late, and the DRM list is a better answer than none.
+        match scrap::wayland::display::get_desktop_rect_for_uinput()
+            .or_else(drm_desktop_rect_for_uinput)
+        {
+            Some(rect) => rect,
+            None => {
                 log::warn!("Failed to get desktop rect for uinput");
                 return;
-            };
-            log::info!(
-                "uinput desktop rect taken from the DRM display list (no compositor here): {rect:?}"
-            );
-            rect
+            }
         }
     };
     // Re-snapshot the baseline on every call: this runs at session init and after every hotplug, and

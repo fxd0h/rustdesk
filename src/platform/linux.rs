@@ -45,10 +45,7 @@ const TERM_XTERM: &str = "xterm";
 
 #[cfg(feature = "drm")]
 lazy_static::lazy_static! {
-    /// `is_login_screen_wayland()` runs `loginctl`, so it must never be called from a poll.
-    /// Memoised for exactly the reason `IS_X11` is: a `--server` process belongs to one seat0
-    /// session for its whole life -- the service loop replaces the process when the session
-    /// changes -- so the answer cannot go stale underneath a caller.
+    /// See `is_login_screen_wayland_cached` for the contract and for what must NOT use it.
     ///
     /// Its own `lazy_static!` block on purpose: `#[cfg]` on a single item inside a shared block
     /// does not survive the macro expansion, and the drm-off build stops compiling.
@@ -73,11 +70,16 @@ lazy_static::lazy_static! {
     /// Corrected only for `drm` builds, so a build without the backend keeps upstream's answer
     /// exactly. Memoised like the original: the greeter session already exists when the service
     /// and the per-session server start, which is when this is first read.
+    ///
+    /// Asks `is_login_screen_wayland()` directly and NOT the memoised form, deliberately. This runs
+    /// once per process and may run during a boot, before loginctl can name the seat0 session; the
+    /// memo must not be populated from here, because a "no" recorded that early would be wrong for
+    /// the rest of the process.
     pub static ref IS_X11: bool = {
         let x11 = hbb_common::platform::linux::is_x11_or_headless();
         #[cfg(feature = "drm")]
         {
-            if x11 && is_login_screen_wayland_cached() {
+            if x11 && is_login_screen_wayland() {
                 log::info!(
                     "drm: seat0 is a Wayland login screen that reads as x11 upstream; \
                      treating it as Wayland so the DRM path is not disabled at the one \
@@ -270,21 +272,35 @@ pub fn is_login_screen_wayland() -> bool {
 /// on any real greeter.
 #[cfg(feature = "drm")]
 pub fn is_x11_for_drm() -> bool {
-    scrap::is_x11() && !is_login_screen_wayland_cached()
+    // BOTH halves are deliberately unmemoised. The two callers are retry loops whose entire job is
+    // to keep asking until seat0 can be named -- `get_display_server()` answers "x11" during a boot
+    // simply because loginctl cannot name the session yet, and at that moment
+    // `is_login_screen_wayland()` cannot see the greeter either and answers "no". Reading a cached
+    // "no" here would freeze that boot-time answer for the life of the process and put the greeter
+    // blind spot straight back, on exactly the cold-boot path these loops exist for.
+    scrap::is_x11() && !is_login_screen_wayland()
 }
 
-/// Memoised `is_login_screen_wayland`, for callers that must not pay for a `loginctl` run.
+/// Memoised `is_login_screen_wayland`, for PER-FRAME callers that must not pay for a `loginctl`
+/// run. Not a general-purpose accessor: see the hazard at the end.
 ///
-/// Also the answer to "is there a compositor to talk to on this seat": at a greeter the
-/// `--server` is started with the compositor variables deliberately blank, so any Wayland
-/// enumeration can only fail. Two paths that used to be unreachable here become reachable once
-/// `IS_X11` starts telling the truth about a greeter, and both of them poll the compositor:
-/// `refresh_wayland_uinput_rect_if_changed` and the `use_logical_scale` probe in
-/// `update_sync_displays`. Measured at an sddm greeter before this guard: 11818 "Failed to get
-/// wayland displays: Could not find wayland compositor" in one session, about three a second,
-/// and the failure is not cached so every call re-probes. Neither call can change an outcome
-/// there -- the enumerator returns an empty list, so `len() > 1` is false either way and the
-/// live layout is `None` -- so skipping them costs nothing and stops the noise.
+/// It answers "is there a compositor to talk to on this seat": at a greeter the `--server` is
+/// started with the compositor variables deliberately blank, so any Wayland enumeration can only
+/// fail. Four paths that were unreachable here become reachable once `IS_X11` starts telling the
+/// truth about a greeter, and all four probe the compositor -- two in upstream code
+/// (`refresh_wayland_uinput_rect_if_changed`, the `use_logical_scale` probe in
+/// `update_sync_displays`) and two in ours (`drm_capturer::get_primary_index`,
+/// `augment_with_wayland_geometry`). Measured at an sddm greeter before this guard: 11818 "Failed
+/// to get wayland displays: Could not find wayland compositor" in one session, about three a
+/// second, and `get_displays()` does not cache the failure so every call re-probes. None of the
+/// four can change an outcome there -- the enumerator returns an empty list, which each of them
+/// already treats as "nothing to do" -- so skipping the probe costs nothing and stops the noise.
+///
+/// **Only call this from the per-session `--server`.** The memo is correct there because that
+/// process is spawned by the service *after* it has identified the seat0 session, so the answer is
+/// already settled the first time any frame path runs. It is NOT correct anywhere that can run
+/// during a boot, before loginctl can name the session: a "no" recorded then would stick for the
+/// process lifetime. `is_x11_for_drm` and the `IS_X11` initialiser both avoid it for that reason.
 #[cfg(feature = "drm")]
 #[inline]
 pub fn is_login_screen_wayland_cached() -> bool {
