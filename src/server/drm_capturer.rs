@@ -1095,9 +1095,6 @@ pub(super) fn get_primary_index() -> usize {
         ProbeState::Available(_, list) => list.clone(),
         _ => return 0,
     };
-    if !wayland_outputs_askable() {
-        return 0;
-    }
     let wl = scrap::wayland::display::get_displays();
     if wl.displays.is_empty() {
         return 0;
@@ -1108,24 +1105,11 @@ pub(super) fn get_primary_index() -> usize {
         .unwrap_or(0)
 }
 
-/// Whether asking the compositor for its outputs can return anything on this seat.
-///
-/// At a login screen there is no compositor to ask -- `Desktop::refresh` starts the greeter's
-/// `--server` with those variables blank on purpose, which is what lets the DRM path work there --
-/// and `scrap::wayland::display::get_displays()` does NOT cache the failure, so every call reopens
-/// a connection and logs a warning. Both callers below already treat an empty output list as "no
-/// augmentation", so skipping the probe cannot change what either returns. Measured at an sddm
-/// greeter: these two alone produced 255 "Could not find wayland compositor" warnings in 75 s.
-fn wayland_outputs_askable() -> bool {
-    !crate::platform::linux::is_login_screen_wayland_cached()
-}
-
 /// DRM reports every monitor at physical size and origin (0,0), stacking a multi-monitor client.
 fn augment_with_wayland_geometry(drm: &[DrmDisplayInfo]) -> Vec<DisplayInfo> {
     let mut infos: Vec<DisplayInfo> = drm.iter().map(display_info_from_drm).collect();
-    // Below two DRM displays there is nothing to augment, so the probe was pure cost even where a
-    // compositor does exist.
-    if drm.len() < 2 || !wayland_outputs_askable() {
+    // Below two DRM displays there is nothing to augment, so asking the compositor was pure cost.
+    if drm.len() < 2 {
         return infos;
     }
     let wl = scrap::wayland::display::get_displays();

@@ -100,12 +100,6 @@ fn refresh_wayland_uinput_rect_if_changed() {
     if is_x11() || !crate::input_service::wayland_use_uinput() {
         return;
     }
-    // A login screen has no compositor to poll, so this can only ever fail and log. The DRM
-    // path owns the rect there and sets it from its own display list in `update_uinput_resolution`.
-    #[cfg(feature = "drm")]
-    if crate::platform::linux::is_login_screen_wayland_cached() {
-        return;
-    }
     {
         let mut lock = WAYLAND_UINPUT_RECT.lock().unwrap();
         if let Some(last_check) = lock.last_check {
@@ -490,27 +484,6 @@ pub(super) fn check_update_displays(all: &Vec<Display>) {
     let _ = update_sync_displays(all);
 }
 
-/// Whether there is a Wayland compositor on this seat worth asking.
-///
-/// `scrap::wayland::display::get_displays()` opens a compositor connection and does NOT cache the
-/// failure, so where there is no compositor it re-probes on every call. At a login screen there is
-/// none by construction -- the greeter's `--server` is started with those variables blank on
-/// purpose -- and the answer it would give (an empty list) cannot change any caller's outcome.
-/// Called last in the `&&` chain so the memoised lookup is never the first thing to run on a
-/// polling thread.
-#[inline]
-#[cfg(target_os = "linux")]
-fn wayland_has_compositor() -> bool {
-    #[cfg(feature = "drm")]
-    {
-        !crate::platform::linux::is_login_screen_wayland_cached()
-    }
-    #[cfg(not(feature = "drm"))]
-    {
-        true
-    }
-}
-
 // Return the converted input snapshot while updating the shared display cache.
 pub(super) fn update_sync_displays(all: &Vec<Display>) -> Vec<DisplayInfo> {
     // For compatibility: if only one display, scale remains 1.0 and we use the physical size for `uinput`.
@@ -518,7 +491,6 @@ pub(super) fn update_sync_displays(all: &Vec<Display>) -> Vec<DisplayInfo> {
     #[cfg(target_os = "linux")]
     let use_logical_scale = !is_x11()
         && crate::is_server()
-        && wayland_has_compositor()
         && scrap::wayland::display::get_displays().displays.len() > 1;
     let displays = all
         .iter()

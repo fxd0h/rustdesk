@@ -43,15 +43,6 @@ const TERM_XTERM_256COLOR: &str = "xterm-256color";
 const TERM_SCREEN_256COLOR: &str = "screen-256color";
 const TERM_XTERM: &str = "xterm";
 
-#[cfg(feature = "drm")]
-lazy_static::lazy_static! {
-    /// See `is_login_screen_wayland_cached` for the contract and for what must NOT use it.
-    ///
-    /// Its own `lazy_static!` block on purpose: `#[cfg]` on a single item inside a shared block
-    /// does not survive the macro expansion, and the drm-off build stops compiling.
-    static ref IS_LOGIN_SCREEN_WAYLAND: bool = is_login_screen_wayland();
-}
-
 lazy_static::lazy_static! {
     /// `is_x11_or_headless()` answers TRUE at a Wayland GREETER, and not by accident:
     /// `get_values_of_seat0` is `_get_values_of_seat0(.., ignore_gdm_wayland = true)`, so it
@@ -281,31 +272,6 @@ pub fn is_x11_for_drm() -> bool {
     scrap::is_x11() && !is_login_screen_wayland()
 }
 
-/// Memoised `is_login_screen_wayland`, for PER-FRAME callers that must not pay for a `loginctl`
-/// run. Not a general-purpose accessor: see the hazard at the end.
-///
-/// It answers "is there a compositor to talk to on this seat": at a greeter the `--server` is
-/// started with the compositor variables deliberately blank, so any Wayland enumeration can only
-/// fail. Four paths that were unreachable here become reachable once `IS_X11` starts telling the
-/// truth about a greeter, and all four probe the compositor -- two in upstream code
-/// (`refresh_wayland_uinput_rect_if_changed`, the `use_logical_scale` probe in
-/// `update_sync_displays`) and two in ours (`drm_capturer::get_primary_index`,
-/// `augment_with_wayland_geometry`). Measured at an sddm greeter before this guard: 11818 "Failed
-/// to get wayland displays: Could not find wayland compositor" in one session, about three a
-/// second, and `get_displays()` does not cache the failure so every call re-probes. None of the
-/// four can change an outcome there -- the enumerator returns an empty list, which each of them
-/// already treats as "nothing to do" -- so skipping the probe costs nothing and stops the noise.
-///
-/// **Only call this from the per-session `--server`.** The memo is correct there because that
-/// process is spawned by the service *after* it has identified the seat0 session, so the answer is
-/// already settled the first time any frame path runs. It is NOT correct anywhere that can run
-/// during a boot, before loginctl can name the session: a "no" recorded then would stick for the
-/// process lifetime. `is_x11_for_drm` and the `IS_X11` initialiser both avoid it for that reason.
-#[cfg(feature = "drm")]
-#[inline]
-pub fn is_login_screen_wayland_cached() -> bool {
-    *IS_LOGIN_SCREEN_WAYLAND
-}
 
 #[inline]
 fn sleep_millis(millis: u64) {

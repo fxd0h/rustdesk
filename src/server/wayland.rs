@@ -115,11 +115,40 @@ struct CapDisplayInfo {
 /// reports scanout pixels, the capture and the client coordinates are in scanout pixels, and there
 /// is no compositor here to have applied a scale in the first place. For a single display the two
 /// agree exactly, since that branch returns the physical size too.
+///
+/// SINGLE DISPLAY is the case this is correct for, and the union below says so honestly rather than
+/// pretending otherwise. On Wayland each output scans out of its own framebuffer, so `crtc->x/y` --
+/// which is where these origins come from -- is (0,0) for every display; that is the whole reason
+/// `augment_with_wayland_geometry` exists to overwrite them from the compositor. With no compositor
+/// to ask, two 1920x1080 outputs are two rectangles both at (0,0) and their union is 1920x1080, not
+/// the 3840x1080 desktop. Nothing on this host can supply the real arrangement: the kernel does not
+/// know it, and the greeter's compositor is the one thing this path deliberately never talks to.
+///
+/// So it does NOT invent one. Laying the outputs out left to right would be a guess about the
+/// compositor's layout that no machine here can check, and a wrong guess puts the pointer on the
+/// wrong output instead of merely limiting it. The union is kept because it is the strictly better
+/// of the two available answers -- it equals the first display exactly, where before this fallback
+/// existed the device was left on its 1920x1080 default and mis-scaled on every display -- and the
+/// limitation is logged once and stated in the docs: at a multi-monitor login screen the pointer
+/// reaches the first display only. Capture of the others is unaffected.
 #[cfg(feature = "drm")]
 fn drm_desktop_rect_for_uinput() -> Option<(i32, i32, i32, i32)> {
     let displays = super::drm_capturer::get_display_infos()?;
     if displays.is_empty() {
         return None;
+    }
+    if displays.len() > 1 && displays.iter().all(|d| d.x == displays[0].x && d.y == displays[0].y) {
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            log::warn!(
+                "drm: {} displays all report origin ({}, {}), so there is no desktop layout to \
+                 derive here and the uinput range covers the first display only; pointer input \
+                 on the other displays will not be positioned correctly at this login screen",
+                displays.len(),
+                displays[0].x,
+                displays[0].y
+            );
+        }
     }
     let minx = displays.iter().map(|d| d.x).min()?;
     let miny = displays.iter().map(|d| d.y).min()?;
@@ -158,38 +187,23 @@ pub(super) async fn update_uinput_resolution() {
     if !crate::input_service::wayland_use_uinput() {
         return;
     }
-    // At a LOGIN SCREEN the Wayland enumerator has nothing to answer with, and not by accident:
-    // `Desktop::refresh` starts the greeter's `--server` with the compositor variables deliberately
-    // blank, because the DRM path talks to the root service and a render node and never to the
-    // compositor -- which is the entire reason it works there. So `get_desktop_rect_for_uinput`
-    // reads the compositor, finds nothing, and the uinput mouse was left on its default range:
-    // measured at an sddm greeter, a 2880x1800 panel got (0,1920)x(0,1080) and the pointer landed
-    // nowhere near where it was aimed, so the password field could not even be clicked.
+    scrap::wayland::display::clear_wayland_displays_cache();
+    // The compositor is the authority on the desktop arrangement and is asked first, at a login
+    // screen too: the greeter's `--server` is started without `WAYLAND_DISPLAY` on purpose, but the
+    // compositor is running and `get_wayland_displays` finds its socket in `XDG_RUNTIME_DIR`.
     //
-    // Take the rect from the displays the DRM path enumerated itself. They are the same displays
-    // being captured, so the coordinate space matches by construction -- and ask for it FIRST here,
-    // rather than letting the compositor query fail on its way to the same answer.
-    let rect = if crate::platform::linux::is_login_screen_wayland_cached() {
-        let Some(rect) = drm_desktop_rect_for_uinput() else {
+    // The DRM display list is the fallback for when it cannot be reached at all. Those are the same
+    // displays being captured, so the coordinate space matches by construction; what it cannot
+    // supply is the arrangement, since every DRM origin is (0,0) on Wayland. Without either, the
+    // uinput mouse keeps its default range -- measured at an sddm greeter before any of this, a
+    // 2880x1800 panel got (0,1920)x(0,1080) and the pointer landed nowhere near where it was aimed.
+    let rect = match scrap::wayland::display::get_desktop_rect_for_uinput()
+        .or_else(drm_desktop_rect_for_uinput)
+    {
+        Some(rect) => rect,
+        None => {
             log::warn!("Failed to get desktop rect for uinput");
             return;
-        };
-        log::info!(
-            "uinput desktop rect taken from the DRM display list (no compositor here): {rect:?}"
-        );
-        rect
-    } else {
-        scrap::wayland::display::clear_wayland_displays_cache();
-        // Still fall back on a session that is not a greeter: the enumerator can also come back
-        // empty on a compositor that answers late, and the DRM list is a better answer than none.
-        match scrap::wayland::display::get_desktop_rect_for_uinput()
-            .or_else(drm_desktop_rect_for_uinput)
-        {
-            Some(rect) => rect,
-            None => {
-                log::warn!("Failed to get desktop rect for uinput");
-                return;
-            }
         }
     };
     // Re-snapshot the baseline on every call: this runs at session init and after every hotplug, and
