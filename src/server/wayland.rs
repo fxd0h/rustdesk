@@ -107,6 +107,30 @@ struct CapDisplayInfo {
     capturer: CapturerPtr,
 }
 
+/// The uinput desktop rect derived from the DRM display list, for the case where there is no
+/// compositor to ask (a login screen). Union of the enumerated displays, in the same coordinate
+/// space the capture reports, as `(minx, maxx, miny, maxy)`.
+///
+/// Deliberately no logical-size handling, unlike `desktop_rect_of` in the Wayland enumerator: DRM
+/// reports scanout pixels, the capture and the client coordinates are in scanout pixels, and there
+/// is no compositor here to have applied a scale in the first place. For a single display the two
+/// agree exactly, since that branch returns the physical size too.
+#[cfg(feature = "drm")]
+fn drm_desktop_rect_for_uinput() -> Option<(i32, i32, i32, i32)> {
+    let displays = super::drm_capturer::get_display_infos()?;
+    if displays.is_empty() {
+        return None;
+    }
+    let minx = displays.iter().map(|d| d.x).min()?;
+    let miny = displays.iter().map(|d| d.y).min()?;
+    let maxx = displays.iter().map(|d| d.x + d.width).max()?;
+    let maxy = displays.iter().map(|d| d.y + d.height).max()?;
+    if maxx <= minx || maxy <= miny {
+        return None;
+    }
+    Some((minx, maxx, miny, maxy))
+}
+
 /// Set the uinput absolute-pointer range to the whole logical desktop so the compositor maps
 /// injected coordinates 1:1 instead of stretching a single-monitor range across all outputs. The
 /// PipeWire path does this inline in `check_init`; the DRM path bypasses check_init so it must do it
@@ -135,9 +159,29 @@ pub(super) async fn update_uinput_resolution() {
         return;
     }
     scrap::wayland::display::clear_wayland_displays_cache();
-    let Some(rect) = scrap::wayland::display::get_desktop_rect_for_uinput() else {
-        log::warn!("Failed to get desktop rect for uinput");
-        return;
+    let rect = match scrap::wayland::display::get_desktop_rect_for_uinput() {
+        Some(rect) => rect,
+        None => {
+            // At a LOGIN SCREEN the Wayland enumerator has nothing to answer with, and not by
+            // accident: `Desktop::refresh` starts the greeter's `--server` with the compositor
+            // variables deliberately blank, because the DRM path talks to the root service and a
+            // render node and never to the compositor -- which is the entire reason it works
+            // there. So `get_desktop_rect_for_uinput` reads the compositor and finds nothing, and
+            // the uinput mouse was left on its default range: measured at an sddm greeter, a
+            // 2880x1800 panel got (0,1920)x(0,1080) and the pointer landed nowhere near where it
+            // was aimed, so the password field could not even be clicked.
+            //
+            // Take the rect from the displays the DRM path enumerated itself. They are the same
+            // displays being captured, so the coordinate space matches by construction.
+            let Some(rect) = drm_desktop_rect_for_uinput() else {
+                log::warn!("Failed to get desktop rect for uinput");
+                return;
+            };
+            log::info!(
+                "uinput desktop rect taken from the DRM display list (no compositor here): {rect:?}"
+            );
+            rect
+        }
     };
     // Re-snapshot the baseline on every call: this runs at session init and after every hotplug, and
     // the baseline is what the client's coordinates are measured against.

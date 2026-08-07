@@ -457,6 +457,26 @@ const SEND_TIMEOUT_VIDEO: u64 = 12_000;
 const SEND_TIMEOUT_OTHER: u64 = SEND_TIMEOUT_VIDEO * 10;
 const SESSION_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Whether the DRM backend can serve a Wayland login screen on this host.
+///
+/// `is_available_cached` is the non-blocking probe the display routing already uses
+/// (`display_service.rs`, `wayland.rs`); the blocking `is_available` documents itself
+/// as "never a routing gate", and this is a routing gate. The probe is warmed on a
+/// thread at server start, so it has normally settled by the time a peer
+/// authenticates; if it has not, this answers false and the connection is refused as
+/// it is today, which is the conservative direction and clears on a retry.
+#[cfg(all(target_os = "linux", feature = "drm"))]
+fn drm_can_serve_login_screen() -> bool {
+    super::drm_capturer::is_available_cached()
+}
+
+/// Without the `drm` feature there is no capture backend for a Wayland greeter at
+/// all, so the refusal stands exactly as it did before.
+#[cfg(all(target_os = "linux", not(feature = "drm")))]
+fn drm_can_serve_login_screen() -> bool {
+    false
+}
+
 impl Connection {
     pub async fn start(
         addr: SocketAddr,
@@ -1959,7 +1979,12 @@ impl Connection {
         #[cfg(target_os = "linux")]
         if self.is_remote() {
             let mut msg = "".to_string();
-            if crate::platform::linux::is_login_screen_wayland() {
+            // This refusal predates the DRM backend and is not conditioned on anything
+            // being able to serve the screen. The DRM path can: it reads the scanout
+            // from the root service and never talks to the compositor or the portal,
+            // which is why it works where the portal cannot. Keep refusing only while
+            // nothing can capture a Wayland greeter.
+            if crate::platform::linux::is_login_screen_wayland() && !drm_can_serve_login_screen() {
                 msg = crate::client::LOGIN_SCREEN_WAYLAND.to_owned()
             } else {
                 let dtype = crate::platform::linux::get_display_server();

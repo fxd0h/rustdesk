@@ -42,6 +42,24 @@ impl Enigo {
         &mut self.custom_mouse
     }
 
+    /// Override the display server this instance was constructed with.
+    ///
+    /// `Default::default` asks `is_x11_or_headless()`, and that answers TRUE at a Wayland
+    /// LOGIN SCREEN: `get_values_of_seat0` skips a gdm/sddm Wayland session by construction,
+    /// so seat0 looks like it has no session at all and the fallback is x11. On that answer
+    /// every method below routes to `xdo`, and an `EnigoXdo` whose context is null -- which is
+    /// what you get with no X server to connect to -- makes all of them SILENT no-ops. A
+    /// custom keyboard and mouse can then be installed and never once consulted, with no error
+    /// on any path. Measured at an sddm Wayland greeter: key and mouse events reached the
+    /// server, the uinput devices existed and the compositor had them open, and not one byte
+    /// was ever written to them.
+    ///
+    /// A caller that installs a custom keyboard/mouse already knows which display server it is
+    /// on. Let it say so instead of leaving the guess in place.
+    pub fn set_is_x11(&mut self, is_x11: bool) {
+        self.is_x11 = is_x11;
+    }
+
     /// Clear remapped keycodes
     pub fn tfc_clear_remapped(&mut self) {
         if let Some(tfc) = &mut self.tfc {
@@ -389,4 +407,56 @@ fn test_key_seq() {
     // Get 6^ in French.
     let mut en = Enigo::new();
     en.key_sequence("^^");
+}
+
+/// Pins BOTH directions of the custom-device dispatch, because the failure it guards against is
+/// silent: with `is_x11` true every call goes to `xdo`, and a null xdo context (no X server to
+/// connect to) drops it without returning an error, so a mouse that reaches nothing looks exactly
+/// like a mouse that works. Asserting only the Wayland direction would pass against that bug.
+#[test]
+fn test_custom_mouse_dispatch_follows_is_x11() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    struct CountingMouse(Arc<AtomicUsize>);
+    impl MouseControllable for CountingMouse {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn as_mut_any(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+        fn mouse_move_to(&mut self, _x: i32, _y: i32) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+        fn mouse_move_relative(&mut self, _x: i32, _y: i32) {}
+        fn mouse_down(&mut self, _button: MouseButton) -> crate::ResultType {
+            Ok(())
+        }
+        fn mouse_up(&mut self, _button: MouseButton) {}
+        fn mouse_click(&mut self, _button: MouseButton) {}
+        fn mouse_scroll_x(&mut self, _length: i32) {}
+        fn mouse_scroll_y(&mut self, _length: i32) {}
+    }
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut en = Enigo::new();
+    en.set_custom_mouse(Box::new(CountingMouse(calls.clone())));
+
+    en.set_is_x11(false);
+    en.mouse_move_to(10, 20);
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        1,
+        "custom mouse was not reached on the non-x11 branch"
+    );
+
+    // Negative control: on the x11 branch the custom device must be bypassed entirely.
+    en.set_is_x11(true);
+    en.mouse_move_to(30, 40);
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        1,
+        "custom mouse was reached on the x11 branch"
+    );
 }

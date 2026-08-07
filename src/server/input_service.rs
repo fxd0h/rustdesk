@@ -663,17 +663,29 @@ pub async fn setup_uinput(minx: i32, maxx: i32, miny: i32, maxy: i32) -> ResultT
     let mouse = super::uinput::client::UInputMouse::new().await?;
     log::info!("UInput mouse created");
 
-    ENIGO
-        .lock()
-        .unwrap()
-        .set_custom_keyboard(Box::new(keyboard));
-    ENIGO.lock().unwrap().set_custom_mouse(Box::new(mouse));
+    let mut en = ENIGO.lock().unwrap();
+    // enigo picked x11-vs-Wayland once, in `Enigo::default()`, from `is_x11_or_headless()` --
+    // which answers "x11" at a Wayland login screen, because `get_values_of_seat0` skips a
+    // gdm/sddm Wayland session by construction. On that answer every enigo call goes to xdo,
+    // whose context is null when there is no X server, and libxdo then no-ops without an error:
+    // the two devices installed just below would be set and never used, which is exactly what a
+    // greeter showed -- events arriving, devices present, zero bytes ever written to them.
+    //
+    // Reaching this function means `wayland_use_uinput()` was true, so this is a statement of
+    // fact rather than a guess, and on every host where enigo already agreed it changes nothing.
+    en.set_is_x11(false);
+    // One lock for both, so there is no window where the keyboard is custom and the mouse is not.
+    en.set_custom_keyboard(Box::new(keyboard));
+    en.set_custom_mouse(Box::new(mouse));
     Ok(())
 }
 
 #[cfg(target_os = "linux")]
 pub async fn setup_rdp_input() -> ResultType<(), Box<dyn std::error::Error>> {
     let mut en = ENIGO.lock()?;
+    // Same reason as `setup_uinput`: the only caller is gated on `wayland_use_rdp_input()`, so
+    // enigo's own one-shot guess must not be allowed to route these custom devices to xdo.
+    en.set_is_x11(false);
     let rdp_info_lock = RDP_SESSION_INFO.lock()?;
     let rdp_info = rdp_info_lock.as_ref().ok_or("RDP session is None")?;
 

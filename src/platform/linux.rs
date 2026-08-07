@@ -43,8 +43,56 @@ const TERM_XTERM_256COLOR: &str = "xterm-256color";
 const TERM_SCREEN_256COLOR: &str = "screen-256color";
 const TERM_XTERM: &str = "xterm";
 
+#[cfg(feature = "drm")]
 lazy_static::lazy_static! {
-    pub static ref IS_X11: bool = hbb_common::platform::linux::is_x11_or_headless();
+    /// `is_login_screen_wayland()` runs `loginctl`, so it must never be called from a poll.
+    /// Memoised for exactly the reason `IS_X11` is: a `--server` process belongs to one seat0
+    /// session for its whole life -- the service loop replaces the process when the session
+    /// changes -- so the answer cannot go stale underneath a caller.
+    ///
+    /// Its own `lazy_static!` block on purpose: `#[cfg]` on a single item inside a shared block
+    /// does not survive the macro expansion, and the drm-off build stops compiling.
+    static ref IS_LOGIN_SCREEN_WAYLAND: bool = is_login_screen_wayland();
+}
+
+lazy_static::lazy_static! {
+    /// `is_x11_or_headless()` answers TRUE at a Wayland GREETER, and not by accident:
+    /// `get_values_of_seat0` is `_get_values_of_seat0(.., ignore_gdm_wayland = true)`, so it
+    /// skips a gdm/sddm Wayland session by construction and `get_display_server` then falls
+    /// back to x11. That premise was upstream's to make -- with the portal there is no way to
+    /// serve a greeter, so calling it "not a usable Wayland session" was right.
+    ///
+    /// The DRM path makes it false: it reads the scanout from the root service and never talks
+    /// to the compositor or the portal, which is exactly why it works there. Every X11-vs-Wayland
+    /// routing decision in the tree reads this value, so leaving it saying "x11" disabled the DRM
+    /// path at the one screen it exists for -- measured on an sddm Wayland greeter: the service
+    /// pre-warm gave up with "session still reads as X11 after 30s", the consumer warm found no
+    /// producer, and the display service skipped the DRM display list and left the client with
+    /// nothing to show.
+    ///
+    /// Corrected only for `drm` builds, so a build without the backend keeps upstream's answer
+    /// exactly. Memoised like the original: the greeter session already exists when the service
+    /// and the per-session server start, which is when this is first read.
+    pub static ref IS_X11: bool = {
+        let x11 = hbb_common::platform::linux::is_x11_or_headless();
+        #[cfg(feature = "drm")]
+        {
+            if x11 && is_login_screen_wayland_cached() {
+                log::info!(
+                    "drm: seat0 is a Wayland login screen that reads as x11 upstream; \
+                     treating it as Wayland so the DRM path is not disabled at the one \
+                     screen it exists for"
+                );
+                false
+            } else {
+                x11
+            }
+        }
+        #[cfg(not(feature = "drm"))]
+        {
+            x11
+        }
+    };
     // Cache for TERM value - once TERM_XTERM_256COLOR is found, reuse it directly
     static ref CACHED_TERM: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
     static ref DATABASE_XTERM_256COLOR: Option<Database> = {
@@ -206,6 +254,41 @@ pub fn is_headless_allowed() -> bool {
 pub fn is_login_screen_wayland() -> bool {
     let values = get_values_of_seat0_with_gdm_wayland(&[0, 2]);
     is_gdm_user(&values[1]) && get_display_server_of_session(&values[0]) == DISPLAY_SERVER_WAYLAND
+}
+
+/// Whether the session is X11 *as far as the DRM capture path is concerned*.
+///
+/// `scrap::is_x11()` answers "x11" at a WAYLAND GREETER. That is not a timing
+/// artefact: `get_values_of_seat0` is `_get_values_of_seat0(.., ignore_gdm_wayland =
+/// true)`, so it skips a gdm/sddm Wayland session by construction, `get_display_server`
+/// finds no session and falls back to x11. Anything that gates the DRM path on it
+/// therefore switches itself off at exactly the screen the DRM path exists to serve.
+///
+/// Measured on an sddm Wayland greeter: the service pre-warm gave up with "session
+/// still reads as X11 after 30s" and the consumer warm logged "found no producer at
+/// startup", so DRM never became available and the login screen could not be captured
+/// on any real greeter.
+#[cfg(feature = "drm")]
+pub fn is_x11_for_drm() -> bool {
+    scrap::is_x11() && !is_login_screen_wayland_cached()
+}
+
+/// Memoised `is_login_screen_wayland`, for callers that must not pay for a `loginctl` run.
+///
+/// Also the answer to "is there a compositor to talk to on this seat": at a greeter the
+/// `--server` is started with the compositor variables deliberately blank, so any Wayland
+/// enumeration can only fail. Two paths that used to be unreachable here become reachable once
+/// `IS_X11` starts telling the truth about a greeter, and both of them poll the compositor:
+/// `refresh_wayland_uinput_rect_if_changed` and the `use_logical_scale` probe in
+/// `update_sync_displays`. Measured at an sddm greeter before this guard: 11818 "Failed to get
+/// wayland displays: Could not find wayland compositor" in one session, about three a second,
+/// and the failure is not cached so every call re-probes. Neither call can change an outcome
+/// there -- the enumerator returns an empty list, so `len() > 1` is false either way and the
+/// live layout is `None` -- so skipping them costs nothing and stops the noise.
+#[cfg(feature = "drm")]
+#[inline]
+pub fn is_login_screen_wayland_cached() -> bool {
+    *IS_LOGIN_SCREEN_WAYLAND
 }
 
 #[inline]
