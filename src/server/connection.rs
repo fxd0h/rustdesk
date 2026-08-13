@@ -93,9 +93,13 @@ lazy_static::lazy_static! {
 
 #[cfg(feature = "flutter")]
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
+const SWITCH_SIDES_UUID_TTL: Duration = Duration::from_secs(10);
+
+#[cfg(feature = "flutter")]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 lazy_static::lazy_static! {
     static ref SWITCH_SIDES_UUID: Arc::<Mutex<HashMap<String, (Instant, uuid::Uuid)>>> = Default::default();
-    static ref PENDING_SWITCH_SIDES_UUID: Arc::<Mutex<HashMap<String, (Instant, uuid::Uuid)>>> = Default::default();
+    static ref PENDING_SWITCH_SIDES_UUID: Arc::<Mutex<HashMap<String, (Instant, uuid::Uuid, bool)>>> = Default::default();
 }
 
 #[cfg(target_os = "windows")]
@@ -118,9 +122,21 @@ fn should_check_linux_headless_os_auth_before_desktop_start(
     is_headless_allowed: bool,
     username: &str,
 ) -> bool {
-    is_headless_allowed
-        && !username.trim().is_empty()
-        && linux_desktop_manager::get_username().is_empty()
+    is_headless_allowed && !username.trim().is_empty()
+}
+
+#[cfg(target_os = "linux")]
+fn linux_desktop_start_credentials(
+    is_headless_allowed: bool,
+    os_login: Option<&OSLogin>,
+) -> Option<(String, String)> {
+    if !is_headless_allowed {
+        return None;
+    }
+    if let Some(os_login) = os_login.filter(|os_login| !os_login.username.trim().is_empty()) {
+        return Some((os_login.username.clone(), os_login.password.clone()));
+    }
+    Some((String::new(), String::new()))
 }
 
 #[cfg(target_os = "linux")]
@@ -363,6 +379,9 @@ pub struct Connection {
     server_audit_file: String,
     controlled_context: Option<ControlledContext>,
     lr: LoginRequest,
+    // Authentication retries may update credentials, but not the requested session scope.
+    // A digest, so no peer-controlled strings are retained.
+    login_scope: Option<[u8; 32]>,
     peer_argb: u32,
     session_last_recv_time: Option<Arc<Mutex<Instant>>>,
     chat_unanswered: bool,
@@ -459,8 +478,11 @@ const SESSION_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Whether the DRM backend can serve a Wayland login screen here.
 ///
-/// The cached probe, not the blocking one: this is a routing gate. Not yet settled answers
-/// false, which refuses as today and clears on a retry.
+/// The cached probe, not the blocking one: this is a routing gate. Available-only ON PURPOSE, and
+/// deliberately NOT symmetric with the seat0 adoption gate: that one only starts Xorg on a
+/// definitive Unavailable (never over a maybe-live greeter), while admission only accepts on a
+/// definitive Available (never a greeter nothing can yet capture). Both err toward refuse-and-retry
+/// during an unsettled probe; admitting there would black-screen a client on a helper-less box.
 #[cfg(all(target_os = "linux", feature = "drm"))]
 fn drm_can_serve_login_screen() -> bool {
     super::drm_capturer::is_available_cached()
@@ -575,6 +597,7 @@ impl Connection {
             server_audit_file: "".to_owned(),
             controlled_context,
             lr: Default::default(),
+            login_scope: None,
             peer_argb: 0u32,
             session_last_recv_time: None,
             chat_unanswered: false,
@@ -2637,6 +2660,90 @@ impl Connection {
         self.terminal_persistent = false;
     }
 
+    // Approval and whitelist decisions must stay bound to the same controller identity and
+    // session scope across authentication retries.
+    fn login_scope_digest(lr: &LoginRequest) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        // Length-prefixed so adjacent fields cannot alias.
+        let mut push = |bytes: &[u8]| {
+            hasher.update((bytes.len() as u64).to_le_bytes());
+            hasher.update(bytes);
+        };
+        push(lr.my_id.as_bytes());
+        // Payloads are destructured exhaustively: a new field fails to compile until it is
+        // either latched here or deliberately ignored.
+        match lr.union.as_ref() {
+            Some(login_request::Union::FileTransfer(ft)) => {
+                let FileTransfer {
+                    dir,
+                    show_hidden,
+                    special_fields: _,
+                } = ft;
+                push(b"file_transfer");
+                push(dir.as_bytes());
+                push(&[*show_hidden as u8]);
+            }
+            Some(login_request::Union::ViewCamera(vc)) => {
+                let ViewCamera { special_fields: _ } = vc;
+                push(b"view_camera");
+            }
+            Some(login_request::Union::Terminal(t)) => {
+                let Terminal {
+                    service_id,
+                    special_fields: _,
+                } = t;
+                push(b"terminal");
+                push(service_id.as_bytes());
+            }
+            Some(login_request::Union::PortForward(pf)) => {
+                let PortForward {
+                    host,
+                    port,
+                    special_fields: _,
+                } = pf;
+                push(b"port_forward");
+                push(host.as_bytes());
+                push(&port.to_le_bytes());
+            }
+            // Variants this build does not know execute as remote, so they latch as remote.
+            None | Some(_) => push(b"remote"),
+        }
+        hasher.finalize().into()
+    }
+
+    // Logging only; security decisions compare digests.
+    fn login_scope_kind(lr: &LoginRequest) -> &'static str {
+        match lr.union.as_ref() {
+            Some(login_request::Union::FileTransfer(_)) => "file_transfer",
+            Some(login_request::Union::ViewCamera(_)) => "view_camera",
+            Some(login_request::Union::Terminal(_)) => "terminal",
+            Some(login_request::Union::PortForward(_)) => "port_forward",
+            _ => "remote",
+        }
+    }
+
+    async fn check_login_scope(&mut self, lr: &LoginRequest) -> bool {
+        let requested = Self::login_scope_digest(lr);
+        match self.login_scope {
+            Some(initial) if initial != requested => {
+                // self.lr still holds the first accepted request, whose scope is the latched one.
+                log::warn!(
+                    "Rejected login scope change: conn_id={}, initial={}, requested={}",
+                    self.inner.id(),
+                    Self::login_scope_kind(&self.lr),
+                    Self::login_scope_kind(lr),
+                );
+                self.send_login_error("Connection not allowed").await;
+                false
+            }
+            Some(_) => true,
+            None => {
+                self.login_scope = Some(requested);
+                true
+            }
+        }
+    }
+
     async fn handle_login_request_without_validation(&mut self, lr: &LoginRequest) {
         self.lr = lr.clone();
         self.peer_argb = crate::str2color(&format!("{}{}", &lr.my_id, &lr.my_platform), 0xff);
@@ -2714,6 +2821,9 @@ impl Connection {
         }
         // After handling CloseReason messages, proceed to process other message types
         if let Some(message::Union::LoginRequest(lr)) = msg.union {
+            if !self.check_login_scope(&lr).await {
+                return false;
+            }
             self.awaiting_2fa = false;
             self.handle_login_request_without_validation(&lr).await;
             if self.authorized {
@@ -2804,6 +2914,7 @@ impl Connection {
 
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             if !should_use_terminal_os_login_scope(self.terminal, &lr.os_login.username) {
+                #[cfg(not(target_os = "linux"))]
                 self.try_start_cm_ipc();
             }
 
@@ -2821,9 +2932,18 @@ impl Connection {
             #[cfg(not(target_os = "linux"))]
             let err_msg = "".to_owned();
             #[cfg(target_os = "linux")]
-            let err_msg = self
+            let err_msg = match self
                 .linux_headless_handle
-                .try_start_desktop(lr.os_login.as_ref());
+                .try_start_desktop(lr.os_login.as_ref())
+                .await
+            {
+                LinuxDesktopStartOutcome::Finished(err_msg) => err_msg,
+                LinuxDesktopStartOutcome::Busy => {
+                    self.send_login_error(crate::client::LOGIN_MSG_DESKTOP_SESSION_NOT_READY)
+                        .await;
+                    return true;
+                }
+            };
 
             // If err is LOGIN_MSG_DESKTOP_SESSION_NOT_READY, just keep this msg and go on checking password.
             if !err_msg.is_empty() && err_msg != crate::client::LOGIN_MSG_DESKTOP_SESSION_NOT_READY
@@ -2842,6 +2962,12 @@ impl Connection {
                 }
                 self.send_login_error(err_msg).await;
                 return true;
+            }
+
+            #[cfg(target_os = "linux")]
+            if !should_use_terminal_os_login_scope(self.terminal, &lr.os_login.username) {
+                // In headless mode, the desktop check above settles the snapshot used by CM routing.
+                self.try_start_cm_ipc();
             }
 
             // https://github.com/rustdesk/rustdesk-server-pro/discussions/646
@@ -3010,7 +3136,7 @@ impl Connection {
                 SWITCH_SIDES_UUID
                     .lock()
                     .unwrap()
-                    .retain(|_, v| v.0.elapsed() < Duration::from_secs(10));
+                    .retain(|_, v| v.0.elapsed() < SWITCH_SIDES_UUID_TTL);
                 let uuid_old = SWITCH_SIDES_UUID.lock().unwrap().remove(&lr.my_id);
                 if let Ok(uuid) = uuid::Uuid::from_slice(_s.uuid.to_vec().as_ref()) {
                     if let Some((_instant, uuid_old)) = uuid_old {
@@ -3750,17 +3876,18 @@ impl Connection {
                     #[cfg(not(any(target_os = "android", target_os = "ios")))]
                     Some(misc::Union::SwitchSidesRequest(s)) => {
                         if let Ok(uuid) = uuid::Uuid::from_slice(&s.uuid.to_vec()[..]) {
-                            crate::server::insert_pending_switch_sides_uuid(
+                            if crate::server::insert_pending_switch_sides_uuid(
                                 self.lr.my_id.clone(),
                                 uuid.clone(),
-                            );
-                            crate::run_me(vec![
-                                "--connect",
-                                &self.lr.my_id,
-                                "--switch_uuid",
-                                uuid.to_string().as_ref(),
-                            ])
-                            .ok();
+                            ) {
+                                crate::run_me(vec![
+                                    "--connect",
+                                    &self.lr.my_id,
+                                    "--switch_uuid",
+                                    uuid.to_string().as_ref(),
+                                ])
+                                .ok();
+                            }
                             self.on_close("switch sides", false).await;
                             return false;
                         }
@@ -6064,23 +6191,40 @@ pub fn insert_switch_sides_uuid(id: String, uuid: uuid::Uuid) {
 
 #[cfg(feature = "flutter")]
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
-pub fn insert_pending_switch_sides_uuid(id: String, uuid: uuid::Uuid) {
+pub fn insert_pending_switch_sides_uuid(id: String, uuid: uuid::Uuid) -> bool {
     let mut uuids = PENDING_SWITCH_SIDES_UUID.lock().unwrap();
-    uuids.retain(|_, (instant, _)| instant.elapsed() < Duration::from_secs(10));
-    uuids.insert(id, (tokio::time::Instant::now(), uuid));
+    uuids.retain(|_, (instant, _, _)| instant.elapsed() < SWITCH_SIDES_UUID_TTL);
+    if uuids.get(&id).map(|(_, stored_uuid, _)| stored_uuid) == Some(&uuid) {
+        return false;
+    }
+    uuids.insert(id, (tokio::time::Instant::now(), uuid, false));
+    true
 }
 
 #[cfg(feature = "flutter")]
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
-pub fn remove_pending_switch_sides_uuid(id: &str, uuid: &uuid::Uuid) -> bool {
+pub fn has_pending_switch_sides_uuid(id: &str, uuid: &uuid::Uuid) -> bool {
     let mut uuids = PENDING_SWITCH_SIDES_UUID.lock().unwrap();
-    uuids.retain(|_, (instant, _)| instant.elapsed() < Duration::from_secs(10));
-    if uuids.get(id).map(|(_, stored_uuid)| stored_uuid == uuid) == Some(true) {
-        uuids.remove(id);
-        true
-    } else {
-        false
+    uuids.retain(|_, (instant, _, _)| instant.elapsed() < SWITCH_SIDES_UUID_TTL);
+    uuids
+        .get(id)
+        .map(|(_, stored_uuid, claimed)| stored_uuid == uuid && !*claimed)
+        == Some(true)
+}
+
+#[cfg(feature = "flutter")]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub fn claim_pending_switch_sides_uuid(id: &str, uuid: &uuid::Uuid) -> bool {
+    let mut uuids = PENDING_SWITCH_SIDES_UUID.lock().unwrap();
+    uuids.retain(|_, (instant, _, _)| instant.elapsed() < SWITCH_SIDES_UUID_TTL);
+    // Keep claimed entries until expiry so replaying a request cannot launch another connection.
+    if let Some((_, stored_uuid, claimed)) = uuids.get_mut(id) {
+        if stored_uuid == uuid && !*claimed {
+            *claimed = true;
+            return true;
+        }
     }
+    false
 }
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -6124,20 +6268,20 @@ async fn start_ipc(
         // Cm run as user, wait until desktop session is ready.
         #[cfg(target_os = "linux")]
         if headless_cm {
-            let mut username = linux_desktop_manager::get_username();
+            let mut username = linux_desktop_manager::get_cached_username();
             loop {
                 if !username.is_empty() {
                     break;
                 }
                 // `_rx_desktop_ready` is used as a wake-up signal from desktop/session state changes
                 // (for example wait_desktop_cm_ready paths). It is not itself a proof of CM readiness.
-                // TODO:
-                // When `_rx_desktop_ready` is closed, `recv()` returns
-                // `None` immediately and this loop may spin if `username` remains empty.
-                // Keep behavior unchanged for now; if field reports appear, handle `Ok(None)` by
-                // breaking/returning to avoid hot-looping.
-                let _res = timeout(1_000, _rx_desktop_ready.recv()).await;
-                username = linux_desktop_manager::get_username();
+                let wait_result = timeout(1_000, _rx_desktop_ready.recv()).await;
+                if matches!(wait_result, Ok(None)) {
+                    return Err(anyhow!(
+                        "Desktop-ready channel closed before a Linux session became available"
+                    ));
+                }
+                username = linux_desktop_manager::get_cached_username();
             }
             let uid = {
                 let username_for_cmd = username.clone();
@@ -6555,6 +6699,27 @@ impl Drop for Connection {
     }
 }
 
+// Login requests are unauthenticated here, so only one may reach loginctl/PAM at a time.
+#[cfg(target_os = "linux")]
+static LINUX_DESKTOP_START_IN_FLIGHT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(target_os = "linux")]
+struct LinuxDesktopStartGuard;
+
+#[cfg(target_os = "linux")]
+impl Drop for LinuxDesktopStartGuard {
+    fn drop(&mut self) {
+        LINUX_DESKTOP_START_IN_FLIGHT.store(false, Ordering::Release);
+    }
+}
+
+#[cfg(target_os = "linux")]
+enum LinuxDesktopStartOutcome {
+    Finished(String),
+    Busy,
+}
+
 #[cfg(target_os = "linux")]
 struct LinuxHeadlessHandle {
     pub is_headless_allowed: bool,
@@ -6575,24 +6740,36 @@ impl LinuxHeadlessHandle {
         }
     }
 
-    pub fn try_start_desktop(&mut self, os_login: Option<&OSLogin>) -> String {
-        if self.is_headless_allowed {
-            match os_login {
-                Some(os_login) => {
-                    linux_desktop_manager::try_start_desktop(&os_login.username, &os_login.password)
-                }
-                None => linux_desktop_manager::try_start_desktop("", ""),
-            }
-        } else {
-            "".to_string()
+    pub async fn try_start_desktop(
+        &mut self,
+        os_login: Option<&OSLogin>,
+    ) -> LinuxDesktopStartOutcome {
+        let Some((username, password)) =
+            linux_desktop_start_credentials(self.is_headless_allowed, os_login)
+        else {
+            return LinuxDesktopStartOutcome::Finished(String::new());
+        };
+        if LINUX_DESKTOP_START_IN_FLIGHT.swap(true, Ordering::AcqRel) {
+            return LinuxDesktopStartOutcome::Busy;
         }
+        let guard = LinuxDesktopStartGuard;
+        let err_msg = match tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            linux_desktop_manager::try_start_desktop(&username, &password)
+        })
+        .await
+        {
+            Ok(err_msg) => err_msg,
+            Err(err) => {
+                log::error!("Linux desktop start task failed: {err}");
+                crate::client::LOGIN_MSG_DESKTOP_XSESSION_FAILED.to_owned()
+            }
+        };
+        LinuxDesktopStartOutcome::Finished(err_msg)
     }
 
     pub async fn wait_desktop_cm_ready(&mut self) {
-        // Asked NOW, not stored at construction: a bool captured pre-auth can lag one seat0
-        // transition behind, and skipping this gate on a stale "not headless" races the just
-        // started session. The snapshot is seeded at server start and re-kicked by the earlier
-        // is_headless() reads in this login flow, so by now it is cheap and current.
+        // A value captured at construction can lag behind a seat0 transition.
         if self.is_headless_allowed && linux_desktop_manager::is_headless() {
             self.tx_desktop_ready.send(()).await.ok();
             let _res = timeout(self.wait_ipc_timeout, self.rx_cm_stream_ready.recv()).await;
@@ -7019,6 +7196,79 @@ fn wildcard_match(pattern: &str, text: &str) -> bool {
 mod test {
     #[allow(unused)]
     use super::*;
+
+    #[cfg(feature = "flutter")]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    #[test]
+    fn test_pending_switch_sides_uuid_is_claimed_once() {
+        let id = uuid::Uuid::new_v4().to_string();
+        let uuid = uuid::Uuid::new_v4();
+        let other_uuid = uuid::Uuid::new_v4();
+        assert!(insert_pending_switch_sides_uuid(id.clone(), uuid.clone()));
+
+        assert!(!insert_pending_switch_sides_uuid(id.clone(), uuid.clone()));
+        assert!(has_pending_switch_sides_uuid(&id, &uuid));
+        assert!(!has_pending_switch_sides_uuid(&id, &other_uuid));
+        assert!(!claim_pending_switch_sides_uuid("other-peer", &uuid));
+        assert!(!claim_pending_switch_sides_uuid(&id, &other_uuid));
+        assert!(claim_pending_switch_sides_uuid(&id, &uuid));
+        assert!(!has_pending_switch_sides_uuid(&id, &uuid));
+        assert!(!claim_pending_switch_sides_uuid(&id, &uuid));
+        assert!(!insert_pending_switch_sides_uuid(id, uuid));
+    }
+
+    #[test]
+    fn login_scope_latches_session_scope_across_login_retries() {
+        let port_forward = |host: &str| {
+            let mut lr = LoginRequest::new();
+            lr.my_id = "peer".to_owned();
+            lr.set_port_forward(PortForward {
+                host: host.to_owned(),
+                port: 3389,
+                ..Default::default()
+            });
+            lr
+        };
+        let first = port_forward("localhost");
+        let scope = |lr: &LoginRequest| Connection::login_scope_digest(lr);
+
+        // A retry may carry new credentials, profile data, options, and unknown fields.
+        let mut retry = port_forward("localhost");
+        retry.password = "secret".into();
+        retry.hwid = "hwid".into();
+        retry.os_login = Some(OSLogin {
+            username: "admin".to_owned(),
+            ..Default::default()
+        })
+        .into();
+        retry.my_name = "New Display Name".to_owned();
+        retry.avatar = "data:image/png;base64,AAAA".to_owned();
+        retry
+            .special_fields
+            .mut_unknown_fields()
+            .add_varint(9999, 1);
+        assert_eq!(scope(&first), scope(&retry));
+
+        // It may not change the controller identity, move the target, or switch type.
+        let mut rotated_id = first.clone();
+        rotated_id.my_id = "rotated-id".to_owned();
+        assert_ne!(scope(&first), scope(&rotated_id));
+        assert_ne!(scope(&first), scope(&port_forward("10.0.0.5")));
+        let mut moved_port = port_forward("localhost");
+        moved_port.mut_port_forward().port = 22;
+        assert_ne!(scope(&first), scope(&moved_port));
+        let terminal = |service_id: &str| {
+            let mut lr = LoginRequest::new();
+            lr.my_id = "peer".to_owned();
+            lr.set_terminal(Terminal {
+                service_id: service_id.to_owned(),
+                ..Default::default()
+            });
+            lr
+        };
+        assert_ne!(scope(&first), scope(&terminal("")));
+        assert_ne!(scope(&terminal("a")), scope(&terminal("b")));
+    }
 
     #[test]
     fn test_wildcard_match() {
