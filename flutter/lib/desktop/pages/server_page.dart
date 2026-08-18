@@ -29,6 +29,12 @@ class DesktopServerPage extends StatefulWidget {
   State<DesktopServerPage> createState() => _DesktopServerPageState();
 }
 
+// Set on the close-button path only. A window close that did not come through the button is
+// external (a session logout closing every window, a compositor kill): kicking every peer with
+// "closed manually" there suppresses the client's reconnect, so the transport drop that follows
+// reports a retryable error instead and the reconnect lands on whatever serves next.
+bool _userInitiatedClose = false;
+
 class _DesktopServerPageState extends State<DesktopServerPage>
     with WindowListener, AutomaticKeepAliveClientMixin {
   final tabController = gFFI.serverModel.tabController;
@@ -55,7 +61,12 @@ class _DesktopServerPageState extends State<DesktopServerPage>
 
   @override
   void onWindowClose() {
-    Future.wait([gFFI.serverModel.closeAll(), gFFI.close()]).then((_) {
+    final manual = _userInitiatedClose;
+    _userInitiatedClose = false;
+    Future.wait([
+      if (manual) gFFI.serverModel.closeAll(),
+      gFFI.close(),
+    ]).then((_) {
       if (isMacOS) {
         RdPlatformChannel.instance.terminate();
       } else {
@@ -324,6 +335,7 @@ class ConnectionManagerState extends State<ConnectionManager>
   }
 
   Future<bool> handleWindowCloseButton() async {
+    _userInitiatedClose = true;
     var tabController = gFFI.serverModel.tabController;
     final connLength = tabController.length;
     if (connLength <= 1) {
@@ -339,6 +351,8 @@ class ConnectionManagerState extends State<ConnectionManager>
       }
       if (res) {
         windowManager.close();
+      } else {
+        _userInitiatedClose = false;
       }
       return res;
     }
