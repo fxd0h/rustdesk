@@ -95,6 +95,13 @@ mod pa_impl {
     pub async fn run(sp: EmptyExtraFieldService) -> ResultType<()> {
         hbb_common::sleep(0.1).await; // one moment to wait for _pa ipc
         RESTARTING.store(false, Ordering::SeqCst);
+        // At a login screen the cm never starts (see start_ipc), so the "_pa" ipc it serves
+        // cannot exist; skip quietly instead of logging a connect error every second.
+        #[cfg(target_os = "linux")]
+        if crate::platform::is_prelogin() {
+            hbb_common::sleep(1.).await;
+            return Ok(());
+        }
         #[cfg(target_os = "linux")]
         let mut stream = crate::ipc::connect(1000, "_pa").await?;
         unsafe {
