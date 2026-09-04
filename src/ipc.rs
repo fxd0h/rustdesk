@@ -545,6 +545,8 @@ pub enum Data {
         height: u32,
         hotx: i32,
         hoty: i32,
+        #[serde(default)]
+        hot_measured: bool,
     },
 }
 
