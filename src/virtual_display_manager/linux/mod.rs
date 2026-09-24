@@ -945,10 +945,7 @@ fn disable(state: &mut State) -> ResultType<()> {
     // actually names: both the card minor and the connector name get recycled, so the device and
     // the KMS object id are what keep it from landing on somebody else's connector.
     for (name, marker) in connectors_named_by_our_entries() {
-        for c in all
-            .iter()
-            .filter(|c| c.name == name && marker.claims(c.device.as_deref(), c.id.as_deref()))
-        {
+        for c in marker_targets(&name, &marker, &all) {
             add_target(&mut targets, c);
         }
     }
@@ -1010,6 +1007,34 @@ struct Target {
     sysfs: String,
     name: String,
     marker: Option<Marker>,
+}
+
+/// The connectors one of our `edid_firmware` entries may be acted on through. An instance marker
+/// names exactly the connector it claims. A legacy marker carries no identity, so on a name that two
+/// cards expose it would claim both, and writing `detect` to a twin that a monitor is plugged into
+/// takes that output down: on twins it touches only a connector that reads our EDID, and a lone
+/// connector of that name as before.
+fn marker_targets<'a>(name: &str, marker: &Marker, all: &'a [Connector]) -> Vec<&'a Connector> {
+    let same: Vec<&Connector> = all.iter().filter(|c| c.name == name).collect();
+    match marker {
+        Marker::Legacy if same.len() != 1 => same.into_iter().filter(|c| c.ours).collect(),
+        _ => same
+            .into_iter()
+            .filter(|c| marker.claims(c.device.as_deref(), c.id.as_deref()))
+            .collect(),
+    }
+}
+
+/// The connectors a re-probe after a dropped hold may write `detect` to: the one carrying the
+/// name, or on twins only those that read our EDID. A rebound connector serves our blob, so the
+/// rule reaches it; a twin that is somebody's monitor is left alone.
+fn reprobe_targets<'a>(name: &str, all: &'a [Connector]) -> Vec<&'a Connector> {
+    let same: Vec<&Connector> = all.iter().filter(|c| c.name == name).collect();
+    if same.len() == 1 {
+        same
+    } else {
+        same.into_iter().filter(|c| c.ours).collect()
+    }
 }
 
 /// The connector a remembered hold may still be released through, or `None` when the hold is stale.
@@ -1176,7 +1201,7 @@ fn probe_held_connectors(state: &mut State) {
 /// Returns whether anything changed, so the caller can re-read a topology this just moved.
 fn reconcile_markers(all: &[Connector]) -> bool {
     let mut drop_names: Vec<String> = Vec::new();
-    let mut reprobe: Vec<String> = Vec::new();
+    let mut reprobe: Vec<(String, Marker)> = Vec::new();
     let mut upgrade: Vec<(String, Marker)> = Vec::new();
     for (name, marker) in connectors_named_by_our_entries() {
         match marker_action(&name, &marker, all) {
@@ -1185,7 +1210,7 @@ fn reconcile_markers(all: &[Connector]) -> bool {
             MarkerAction::Drop { reprobe: probe } => {
                 log::info!("headless display: dropping the hold on {name} ({marker:?})");
                 if probe {
-                    reprobe.push(name.clone());
+                    reprobe.push((name.clone(), marker.clone()));
                 }
                 drop_names.push(name);
             }
@@ -1204,12 +1229,18 @@ fn reconcile_markers(all: &[Connector]) -> bool {
             log::info!("headless display: the hold on {name} now records which connector it is");
         }
     }
-    for c in all
-        .iter()
-        .filter(|c| reprobe.iter().any(|name| *name == c.name))
-    {
-        if let Err(e) = write_status(&c.sysfs, "detect") {
-            log::warn!("headless display: cannot re-probe {}: {e}", c.sysfs);
+    for (name, marker) in &reprobe {
+        // An instance marker whose connector is gone re-probes whatever now holds the name (see
+        // above); a legacy one has no instance to have lost. Either way, on twins only the one
+        // that reads our EDID is written to: the other is somebody's monitor.
+        let targets: Vec<&Connector> = match marker {
+            Marker::Legacy => marker_targets(name, marker, all),
+            Marker::Instance { .. } => reprobe_targets(name, all),
+        };
+        for c in targets {
+            if let Err(e) = write_status(&c.sysfs, "detect") {
+                log::warn!("headless display: cannot re-probe {}: {e}", c.sysfs);
+            }
         }
     }
     true
@@ -1879,6 +1910,43 @@ mod tests {
             unrenderable("card1-Writeback-1", "Writeback-1", false),
             unrenderable("card1-Writeback-2", "Writeback-2", false),
         ]
+    }
+
+    #[test]
+    fn a_legacy_marker_touches_only_a_connector_it_names_or_that_carries_our_edid() {
+        let names = |v: Vec<&Connector>| v.iter().map(|c| c.sysfs.clone()).collect::<Vec<_>>();
+        let twins = [
+            c("card0-DP-1", "DP-1", true, false),
+            c("card1-DP-1", "DP-1", true, false),
+        ];
+        assert!(marker_targets("DP-1", &Marker::Legacy, &twins).is_empty());
+        let one_ours = [
+            c("card0-DP-1", "DP-1", true, false),
+            c("card1-DP-1", "DP-1", true, true),
+        ];
+        assert_eq!(names(marker_targets("DP-1", &Marker::Legacy, &one_ours)), ["card1-DP-1"]);
+        let lone = [c("card0-DP-1", "DP-1", true, false)];
+        assert_eq!(names(marker_targets("DP-1", &Marker::Legacy, &lone)), ["card0-DP-1"]);
+        let instance = Marker::Instance {
+            device: "card1".to_owned(),
+            id: "card1-DP-1".to_owned(),
+        };
+        assert_eq!(names(marker_targets("DP-1", &instance, &twins)), ["card1-DP-1"]);
+    }
+
+    /// Review of 24-sep: the re-probe after a dropped instance marker used to write `detect` to
+    /// every connector carrying the name, a twin with a real monitor included.
+    #[test]
+    fn an_instance_drop_reprobes_only_a_twin_that_reads_our_edid() {
+        let twins = [
+            c("card0-DP-1", "DP-1", true, false),
+            c("card1-DP-1", "DP-1", true, true),
+        ];
+        let names: Vec<&str> = reprobe_targets("DP-1", &twins).iter().map(|c| c.sysfs.as_str()).collect();
+        assert_eq!(names, ["card1-DP-1"]);
+        let lone = [c("card0-DP-1", "DP-1", true, false)];
+        assert_eq!(reprobe_targets("DP-1", &lone).len(), 1, "a lone connector is always reached");
+        assert!(reprobe_targets("DP-2", &twins).is_empty());
     }
 
     // fufesou's P3: `disable()` used to pass only the remembered path to `add_target()`, so a
