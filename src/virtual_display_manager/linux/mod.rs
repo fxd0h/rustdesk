@@ -312,6 +312,58 @@ fn is_enabled() -> bool {
     Config::get_bool_option(OPTION_ALLOW_HEADLESS_DISPLAY)
 }
 
+/// Whether the capture side settles a topology change instead of demoting DRM at once: the
+/// operator turned the feature on, or a connector of ours is held. The second arm is for a
+/// capture process whose config predates the switch (a `--server` reads its config when it
+/// starts): after a force the EDID in sysfs says ours, and the transitions the watcher makes
+/// from then on settle as they do for a process that saw the switch.
+fn transition_may_settle_on(enabled: bool, all: &[Connector]) -> bool {
+    enabled || all.iter().any(|c| c.ours)
+}
+
+pub(crate) fn transition_may_settle() -> bool {
+    transition_may_settle_on(switch_on(), &connectors())
+}
+
+/// Why a cold, empty DRM probe is expected to fill soon: nothing real is attached, and a scanout
+/// of ours is already held or one is forceable exactly the way `enable()` would force it. The
+/// capture process evaluates this from sysfs and its own config; the watcher's settle window lives
+/// in the root service and cannot be read from here.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ScanoutExpectation {
+    pub enabled: bool,
+    pub no_real_output: bool,
+    pub ours: bool,
+    pub forceable: bool,
+}
+
+impl ScanoutExpectation {
+    pub fn expected(&self) -> bool {
+        self.no_real_output && (self.ours || (self.enabled && self.forceable))
+    }
+}
+
+fn scanout_expectation_on(enabled: bool, all: &[Connector], edid_param: &str) -> ScanoutExpectation {
+    // The same two refusals `enable()` makes: an unidentifiable connector is never forced, and a
+    // connector another entry already governs is never given our EDID.
+    let forceable = pick_connector(all).is_some_and(|t| {
+        marker_of(t).is_some()
+            && !edid_entries(edid_param)
+                .iter()
+                .any(|e| foreign_entry_covers(e, &t.name))
+    });
+    ScanoutExpectation {
+        enabled,
+        no_real_output: no_real_output(all),
+        ours: all.iter().any(|c| c.ours),
+        forceable,
+    }
+}
+
+pub(crate) fn scanout_expectation() -> ScanoutExpectation {
+    scanout_expectation_on(switch_on(), &connectors(), &read_edid_param())
+}
+
 // ---------------------------------------------------------------------------------------------
 // The synthetic EDID
 //
@@ -1652,6 +1704,43 @@ mod tests {
                 id: sysfs.to_owned(),
             },
         }
+    }
+
+    #[test]
+    fn a_scanout_is_expected_only_where_the_watcher_would_give_one() {
+        let free = [c("card0-HDMI-A-1", "HDMI-A-1", false, false)];
+        assert!(scanout_expectation_on(true, &free, "").expected());
+        assert!(!scanout_expectation_on(false, &free, "").expected(), "switch off");
+        let ours = [c("card0-HDMI-A-1", "HDMI-A-1", true, true)];
+        assert!(scanout_expectation_on(false, &ours, "").expected(), "held: the switch is not needed");
+        assert!(!scanout_expectation_on(true, &macbook_pro_2018(), "").expected(), "a real output");
+        assert!(!scanout_expectation_on(true, &[], "").expected());
+        let edp = [c("card0-eDP-1", "eDP-1", false, false)];
+        assert!(!scanout_expectation_on(true, &edp, "").expected(), "nothing forceable");
+        let unidentified = [Connector {
+            device: None,
+            id: None,
+            ..c("card0-HDMI-A-1", "HDMI-A-1", false, false)
+        }];
+        assert!(!scanout_expectation_on(true, &unidentified, "").expected());
+        assert!(!scanout_expectation_on(true, &free, "HDMI-A-1:edid/operator.bin").expected());
+        assert!(!scanout_expectation_on(true, &free, "HDMI:edid/operator.bin").expected(), "a prefix");
+    }
+
+    /// A `--server` whose config predates the switch still settles once a connector of ours is
+    /// up: the EDID in sysfs says so. A real output alone, with the switch off, does not.
+    #[test]
+    fn a_held_connector_opens_the_gate_for_a_process_whose_config_predates_the_switch() {
+        let held = [c("card0-HDMI-A-1", "HDMI-A-1", true, true)];
+        assert!(transition_may_settle_on(false, &held), "held: the switch is not needed");
+        let with_real = [
+            c("card0-DP-1", "DP-1", true, false),
+            c("card0-HDMI-A-1", "HDMI-A-1", true, true),
+        ];
+        assert!(transition_may_settle_on(false, &with_real));
+        assert!(!scanout_expectation_on(true, &with_real, "").expected(), "not a cold start");
+        assert!(!transition_may_settle_on(false, &[c("card0-DP-1", "DP-1", true, false)]));
+        assert!(transition_may_settle_on(true, &[c("card0-DP-1", "DP-1", true, false)]));
     }
 
     fn unrenderable(sysfs: &str, name: &str, connected: bool) -> Connector {
