@@ -669,7 +669,7 @@ pub fn common_get_error() -> String {
 }
 
 #[cfg(all(test, feature = "drm"))]
-mod tests {
+mod drm_portal_tests {
     use super::*;
     use std::cell::Cell;
 
