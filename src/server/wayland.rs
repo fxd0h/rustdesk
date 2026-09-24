@@ -219,6 +219,22 @@ pub(super) async fn update_uinput_resolution() {
 
 #[tokio::main(flavor = "current_thread")]
 pub(super) async fn ensure_inited() -> ResultType<()> {
+    // A box whose headless output is still coming up: hold before the portal, bounded. If DRM
+    // came up, the short-circuit below takes it; if the portal was started here, check_init
+    // finds it up and does nothing.
+    #[cfg(feature = "headless-display")]
+    if cold_start_door_open() {
+        if let Some(r) = portal_unless_drm_after_hold(
+            || super::drm_capturer::wait_for_headless_scanout(super::drm_capturer::HEADLESS_VIDEO_HOLD),
+            super::drm_capturer::is_available_cached,
+            super::drm_capturer::cold_start_still_settling,
+            check_init,
+        )
+        .await
+        {
+            r?;
+        }
+    }
     // DRM/KMS capture (opt-in): the root service owns the reader and the capturer self-inits over
     // IPC, so there is no PipeWire recorder to initialize here. But we still must set the uinput
     // desktop rect (check_init does this on the PipeWire path, and the DRM path skips check_init).
@@ -236,6 +252,12 @@ pub(super) fn is_inited() -> Option<Message> {
     } else {
         #[cfg(feature = "drm")]
         if super::drm_capturer::is_available_cached() {
+            return None;
+        }
+        // The login door holds or fails the login while the cold start settles: a box telling
+        // the peer to answer a portal dialog would be stale, or wrong.
+        #[cfg(feature = "headless-display")]
+        if super::drm_capturer::cold_start_still_settling() {
             return None;
         }
         if CAP_DISPLAY_INFO.read().unwrap().is_empty() {
@@ -307,6 +329,7 @@ pub(super) async fn check_init() -> ResultType<()> {
                     return Ok(());
                 }
 
+                log::info!("wayland: starting the ScreenCast portal");
                 let mut all = Display::all()?;
                 log::debug!("Initializing displays with fill_displays()");
                 {
@@ -364,6 +387,20 @@ pub(super) async fn check_init() -> ResultType<()> {
 }
 
 pub(super) async fn get_displays_and_primary() -> ResultType<(Vec<DisplayInfo>, usize)> {
+    // The login door: the same hold as `ensure_inited`, with the login's own bound.
+    #[cfg(feature = "headless-display")]
+    if cold_start_door_open() {
+        if let Some(r) = portal_unless_drm_after_hold(
+            || super::drm_capturer::wait_for_headless_scanout(super::drm_capturer::HEADLESS_LOGIN_HOLD),
+            super::drm_capturer::is_available_cached,
+            super::drm_capturer::cold_start_still_settling,
+            check_init,
+        )
+        .await
+        {
+            r?;
+        }
+    }
     #[cfg(feature = "drm")]
     if super::drm_capturer::is_available_cached() {
         // This function runs once per login (update_get_sync_displays_on_login is its only
@@ -494,6 +531,49 @@ where
         Ok(()) => None,
         Err(e) => Some(Err(e)),
     }
+}
+
+/// Whether a door may hold at all: a Wayland session with no portal up yet. A portal that is
+/// already up, X11, and a cached verdict either way are never held.
+#[cfg(feature = "headless-display")]
+fn cold_start_door_open() -> bool {
+    // The DRM verdict first: a login DRM can serve never touches the portal map, whose write
+    // guard a portal start holds for as long as its consent dialog waits.
+    !super::drm_capturer::is_available_cached()
+        && !is_x11()
+        && CAP_DISPLAY_INFO.read().unwrap().is_empty()
+}
+
+/// The cold-start door, closure-injected like `drm_capturer_or_portal`: wait out the hold, then
+/// leave DRM to the caller's own short-circuit if it came up. If the hold ran out with the cold
+/// start still settling, the caller gets an error the peer can retry on, not a portal: on the
+/// box this is for nobody answers its dialog. The portal starts only once the probe has
+/// demoted, which is the bounded fallback.
+#[cfg(feature = "headless-display")]
+async fn portal_unless_drm_after_hold<W, WF, A, S, P, PF>(
+    wait: W,
+    drm_ready: A,
+    still_settling: S,
+    start_portal: P,
+) -> Option<ResultType<()>>
+where
+    W: FnOnce() -> WF,
+    WF: std::future::Future<Output = ()>,
+    A: FnOnce() -> bool,
+    S: FnOnce() -> bool,
+    P: FnOnce() -> PF,
+    PF: std::future::Future<Output = ResultType<()>>,
+{
+    wait().await;
+    if drm_ready() {
+        return None;
+    }
+    if still_settling() {
+        return Some(Err(hbb_common::anyhow::anyhow!(
+            "the headless output is still coming up; retry in a few seconds"
+        )));
+    }
+    Some(start_portal().await)
 }
 
 pub(super) fn get_capturer_for_display(
@@ -742,4 +822,125 @@ mod drm_portal_tests {
             "the settle question must be asked after the build, not sampled before it"
         );
     }
+
+    /// One door through the hold, with the verdict, the gate and the sleep injected: a fake
+    /// verdict that answers Unsettled `n` times and `then` after. Counts sleeps and portal
+    /// starts and reports an error, so removing the wait, the loop or the retry arm fails it.
+    #[cfg(feature = "headless-display")]
+    fn hold_once(
+        unsettled_answers: u32,
+        then: super::super::drm_capturer::Availability,
+        expected: bool,
+        still_settling: bool,
+        bound: std::time::Duration,
+    ) -> (u32, u32, bool) {
+        use super::super::drm_capturer::{
+            wait_for_headless_scanout_with, Availability,
+        };
+        let calls = Cell::new(0u32);
+        let verdict = || {
+            calls.set(calls.get() + 1);
+            if calls.get() <= unsettled_answers {
+                Availability::Unsettled
+            } else {
+                then
+            }
+        };
+        let sleeps = Cell::new(0u32);
+        let portal_starts = Cell::new(0u32);
+        let rt = hbb_common::tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let errored = rt.block_on(async {
+            let out = portal_unless_drm_after_hold(
+                || {
+                    wait_for_headless_scanout_with(
+                        &verdict,
+                        || expected,
+                        |_| {
+                            sleeps.set(sleeps.get() + 1);
+                            assert!(sleeps.get() < 100, "the hold never ends");
+                            std::future::ready(())
+                        },
+                        bound,
+                    )
+                },
+                || verdict() == Availability::Available,
+                || still_settling,
+                || async {
+                    portal_starts.set(portal_starts.get() + 1);
+                    Ok(())
+                },
+            )
+            .await;
+            matches!(out, Some(Err(_)))
+        });
+        (sleeps.get(), portal_starts.get(), errored)
+    }
+
+    /// rustdesk#15908 review (zhou, 23-sep), finding 1: "do not start PipeWire" while the force
+    /// is in its window. The verdict goes Unsettled three times, then Available: three turns of
+    /// the hold, no portal, no error, and the episode is cleared by the Available.
+    #[cfg(feature = "headless-display")]
+    #[test]
+    fn the_cold_start_hold_keeps_the_portal_shut_until_drm_comes_up() {
+        use super::super::drm_capturer::{hold_test_support as hold, Availability};
+        let _serial = hold::serial();
+        hold::set_episode(None);
+        hold::set_probe_failures(0);
+        assert_eq!(
+            hold_once(3, Availability::Available, true, false, std::time::Duration::from_secs(20)),
+            (3, 0, false),
+            "(sleeps, portal starts, errored)"
+        );
+        assert!(hold::episode().is_none(), "Available clears the episode");
+    }
+
+    /// The hold is bounded once per episode: with the deadline behind us there is no turn at
+    /// all. Still settling when it runs out, the door fails the login instead of starting the
+    /// portal; once the probe has demoted, the portal starts. A second door in the same episode
+    /// does not hold either, and a door's own bound caps the episode.
+    #[cfg(feature = "headless-display")]
+    #[test]
+    fn the_cold_start_hold_is_bounded_once_per_episode() {
+        use super::super::drm_capturer::{hold_test_support as hold, Availability};
+        let _serial = hold::serial();
+        hold::set_probe_failures(0);
+        let past = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        let twenty = std::time::Duration::from_secs(20);
+        hold::set_episode(Some(past));
+        assert_eq!(hold_once(u32::MAX, Availability::Available, true, true, twenty), (0, 0, true));
+        assert!(hold::episode().is_some(), "the episode stays until Available is seen");
+        assert_eq!(hold_once(u32::MAX, Availability::Available, true, true, twenty), (0, 0, true));
+        assert_eq!(hold_once(u32::MAX, Availability::Available, true, false, twenty), (0, 1, false));
+        // A door's own bound caps the episode: a zero bound is one check and no turn.
+        hold::set_episode(None);
+        assert_eq!(hold_once(u32::MAX, Availability::Available, true, true, std::time::Duration::ZERO), (0, 0, true));
+        assert!(hold::episode().is_some());
+        hold::set_episode(None);
+    }
+
+    /// Nothing to wait out: the gate closed, DRM already up, a verdict either way, or a probe
+    /// error. None of these opens an episode.
+    #[cfg(feature = "headless-display")]
+    #[test]
+    fn the_hold_is_skipped_when_there_is_no_settle_to_wait_out() {
+        use super::super::drm_capturer::{hold_test_support as hold, Availability};
+        let _serial = hold::serial();
+        let twenty = std::time::Duration::from_secs(20);
+        hold::set_probe_failures(0);
+        hold::set_episode(None);
+        assert_eq!(hold_once(u32::MAX, Availability::Available, false, false, twenty), (0, 1, false));
+        assert!(hold::episode().is_none(), "the gate closed: no episode");
+        hold::set_episode(Some(std::time::Instant::now() + std::time::Duration::from_secs(9)));
+        assert_eq!(hold_once(0, Availability::Available, true, false, twenty), (0, 0, false));
+        assert!(hold::episode().is_none(), "Available at the door clears the episode");
+        assert_eq!(hold_once(0, Availability::Unavailable, true, false, twenty), (0, 1, false));
+        assert!(hold::episode().is_none(), "a negative verdict: no episode, the portal");
+        hold::set_probe_failures(1);
+        assert_eq!(hold_once(u32::MAX, Availability::Available, true, false, twenty), (0, 1, false));
+        assert!(hold::episode().is_none(), "a probe error is not a settle: no episode");
+        hold::set_probe_failures(0);
+    }
+
 }
