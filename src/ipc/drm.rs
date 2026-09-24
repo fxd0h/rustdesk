@@ -45,6 +45,14 @@ pub struct DmabufDesc {
     pub hdr_max_nits: u32,
     /// True: the fd rides this message's SCM_RIGHTS cmsg. False: import-once cache hit for `fb_id`.
     pub has_fd: bool,
+    /// The DRM `rotation` bitmask the primary plane scanned this frame out with, from
+    /// `drmtap_plane_rotation()` (libdrmtap 0.5.8); a plane without the property is reported as
+    /// rotate-0. `None` when the library cannot say (older than 0.5.8, nothing bound, or the
+    /// property set unreadable). A frame from a plane that rotated in hardware is already
+    /// upright; one from a plane that did not is turned by the output transform. See
+    /// `frame_transform`.
+    #[serde(default)]
+    pub plane_rotation: Option<u32>,
 }
 
 pub(crate) fn drm_ipc_path() -> String {
@@ -100,6 +108,8 @@ enum DrmProducerMsg {
         width: u32,
         height: u32,
         data: Bytes,
+        /// See `DmabufDesc::plane_rotation`.
+        plane_rotation: Option<u32>,
     },
     Cursor {
         id: u64,
@@ -960,8 +970,17 @@ async fn handle_drm_conn(stream: Connection) -> ResultType<()> {
                 width,
                 height,
                 data,
+                plane_rotation,
             }) => {
-                conn.send_msg(&Data::DrmFrame { width, height }, None).await?;
+                conn.send_msg(
+                    &Data::DrmFrame {
+                        width,
+                        height,
+                        plane_rotation,
+                    },
+                    None,
+                )
+                .await?;
                 conn.send_raw(data).await?;
                 credit -= 1; // one frame in flight until the consumer acks it
             }
@@ -1036,6 +1055,9 @@ fn drm_capture_worker(
             // state itself (CREDIT_STALL) since our watchdog cannot advance.
             None
         } else if use_dmabuf {
+            // Read before the grab, so it names the scanout this frame comes from and never
+            // borrows the reader while the grab result is alive.
+            let plane_rotation = reader.plane_rotation();
             Some(match reader.grab_desc() {
                 Ok((fd, d)) => Ok(DrmProducerMsg::Frame {
                     desc: DmabufDesc {
@@ -1051,17 +1073,20 @@ fn drm_capture_worker(
                         hdr_eotf: d.hdr_eotf,
                         hdr_max_nits: d.hdr_max_nits,
                         has_fd: true, // every exported frame carries its fd; see the send below
+                        plane_rotation,
                     },
                     fd: Some(fd),
                 }),
                 Err(err) => Err(err),
             })
         } else {
+            let plane_rotation = reader.plane_rotation();
             Some(match reader.grab() {
                 Ok((buf, w, h)) => Ok(DrmProducerMsg::FrameCpu {
                     width: w as u32,
                     height: h as u32,
                     data: Bytes::copy_from_slice(buf),
+                    plane_rotation,
                 }),
                 Err(err) => Err(err),
             })
@@ -1538,7 +1563,7 @@ mod drm_conn_tests {
         let (a, b) = tokio::net::UnixStream::pair().unwrap();
         let mut tx = DrmConn::new(a);
         let mut rx = DrmConn::new(b);
-        tx.send_msg(&Data::DrmFrame { width: 1920, height: 1080 }, None)
+        tx.send_msg(&Data::DrmFrame { width: 1920, height: 1080, plane_rotation: None }, None)
             .await
             .unwrap();
         let (data, fd) = rx.recv_msg().await.unwrap();
@@ -1546,7 +1571,8 @@ mod drm_conn_tests {
             data,
             Data::DrmFrame {
                 width: 1920,
-                height: 1080
+                height: 1080,
+                plane_rotation: None,
             }
         ));
         assert!(fd.is_none(), "no fd was sent, none must be reported");
@@ -1558,7 +1584,7 @@ mod drm_conn_tests {
         let mut tx = DrmConn::new(a);
         let mut rx = DrmConn::new(b);
         let (rd, wr) = pipe();
-        tx.send_msg(&Data::DrmFrame { width: 4, height: 4 }, Some(rd.as_fd()))
+        tx.send_msg(&Data::DrmFrame { width: 4, height: 4, plane_rotation: None }, Some(rd.as_fd()))
             .await
             .unwrap();
         let (_data, fd) = rx.recv_msg().await.unwrap();
@@ -1672,6 +1698,7 @@ mod drm_conn_tests {
         let payload = serde_json::to_vec(&Data::DrmFrame {
             width: 8,
             height: 8,
+            plane_rotation: None,
         })
         .unwrap();
         let prefix = (payload.len() as u32).to_be_bytes();
@@ -1683,7 +1710,8 @@ mod drm_conn_tests {
             data,
             Data::DrmFrame {
                 width: 8,
-                height: 8
+                height: 8,
+                plane_rotation: None,
             }
         ));
         let kept = fd.expect("the first surplus fd must be kept");
