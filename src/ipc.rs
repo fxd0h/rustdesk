@@ -540,7 +540,13 @@ pub enum Data {
     /// Service -> client: a frame header; the packed BGRA pixels follow via `send_raw()`.
     /// CPU-fallback path (no render node, or no transferable dma-buf): pixels cross the wire.
     #[cfg(all(target_os = "linux", feature = "drm"))]
-    DrmFrame { width: u32, height: u32 },
+    DrmFrame {
+        width: u32,
+        height: u32,
+        /// See `DmabufDesc::plane_rotation`; absent from a producer older than this field.
+        #[serde(default)]
+        plane_rotation: Option<u32>,
+    },
     /// Service -> client: a zero-copy dma-buf frame descriptor. The scanout fd is NOT a field; when
     /// `desc.has_fd` it rides an SCM_RIGHTS ancillary message on the same `DrmConn::send_msg`, and
     /// there is NO trailing `send_raw()` body. The unprivileged `--server` imports the fd and does

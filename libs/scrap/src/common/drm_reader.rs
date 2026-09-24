@@ -528,6 +528,19 @@ impl DrmReader {
             .map(|s| s.to_owned())
     }
 
+    /// The DRM `rotation` bitmask the primary plane scans out with, read now, so call it next to
+    /// the grab it describes. `None` when the library predates the call (0.5.8), when the plane
+    /// has no such property (the compositor can only have rotated in software) or when nothing
+    /// is bound: the consumer cannot tell those apart and does not need to, since a plane that
+    /// cannot rotate and an unknown one both leave the frame to be turned by the output.
+    pub fn plane_rotation(&mut self) -> Option<u32> {
+        let f = self.lib.plane_rotation?;
+        let mut rotation: u32 = 0;
+        // SAFETY: self.ctx is a live context and `rotation` outlives the call.
+        let rc = unsafe { f(self.ctx, &mut rotation) };
+        (rc == 0).then_some(rotation)
+    }
+
     /// Zero-copy EXPORT grab: fills a `drmtap_dmabuf_desc` (dma-buf fd, plane layout, HDR metadata) WITHOUT mapping, detiling or copying pixels, so on this
     /// path the root process never loads libEGL/libGLESv2. The exported fd is READ-ONLY (libdrmtap drops `DRM_RDWR` and `dup` shares that open file
     /// description), so the `--server` that receives it can map the scanout but never write the live framebuffer. Validation here is METADATA ONLY.
