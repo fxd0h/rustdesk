@@ -216,9 +216,11 @@ fn plane_rotation_degrees(mask: u32) -> Option<i32> {
 /// (i915 + mutter at 180, measured: the scanout is upright and the plane reports rotate-180), or
 /// in software, drawing the scanout already turned when the plane cannot (virtio-gpu, vmwgfx:
 /// no such property; measured: 180 comes out upside down and 90/270 sideways inside the native
-/// mode). `wl_output` cannot tell the two apart; `plane_rotation` can, and `None` (a libdrmtap
-/// before 0.5.8, or a plane without the property) keeps the pre-0.5.8 rule: 90/270 turned, 180
-/// left alone. The cursor does not go through this: see `Shared::cursor_transform`.
+/// mode). `wl_output` cannot tell the two apart; `plane_rotation` can: a plane without the
+/// property arrives as rotate-0 (the reader maps it, see `DrmReader::plane_rotation`) and the
+/// frame is turned by the whole transform. `None` (a libdrmtap before 0.5.8, or nothing the
+/// library could read) keeps the pre-0.5.8 rule: 90/270 turned, 180 left alone. The cursor does
+/// not go through this: see `Shared::cursor_transform`.
 fn frame_transform(wl_transform: i32, plane_rotation: Option<u32>) -> i32 {
     match plane_rotation.and_then(plane_rotation_degrees) {
         Some(plane) => (wl_transform - plane).rem_euclid(360),
@@ -2455,7 +2457,7 @@ mod drm_capturer_tests {
             Ok(_) => panic!("expected a pixel-buffer frame"),
             Err(err) => panic!("expected a delivered frame, got {err}"),
         }
-        // A producer that cannot say (pre-0.5.8) keeps the old rule: 180 left alone.
+        // A producer that cannot say (pre-0.5.8 library) keeps the old rule: 180 left alone.
         put_frame_with(&c, w, h, None, &src);
         match c.frame(Duration::from_millis(50)) {
             Ok(Frame::PixelBuffer(pb)) => {

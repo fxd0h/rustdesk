@@ -46,9 +46,11 @@ pub struct DmabufDesc {
     /// True: the fd rides this message's SCM_RIGHTS cmsg. False: import-once cache hit for `fb_id`.
     pub has_fd: bool,
     /// The DRM `rotation` bitmask the primary plane scanned this frame out with, from
-    /// `drmtap_plane_rotation()` (libdrmtap 0.5.8). `None` when the library, the driver or the
-    /// plane cannot say. A frame from a plane that rotated in hardware is already upright; one
-    /// from a plane that did not is turned by the output transform. See `frame_transform`.
+    /// `drmtap_plane_rotation()` (libdrmtap 0.5.8); a plane without the property is reported as
+    /// rotate-0. `None` when the library cannot say (older than 0.5.8, nothing bound, or the
+    /// property set unreadable). A frame from a plane that rotated in hardware is already
+    /// upright; one from a plane that did not is turned by the output transform. See
+    /// `frame_transform`.
     #[serde(default)]
     pub plane_rotation: Option<u32>,
 }
