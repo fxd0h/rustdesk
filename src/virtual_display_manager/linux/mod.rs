@@ -35,6 +35,67 @@ use std::{
 /// registered anywhere for that to hold.
 pub const OPTION_ALLOW_HEADLESS_DISPLAY: &str = "allow-headless-display";
 
+/// The switch as the service last received it over `_service`, or unset. A pushed option is
+/// applied in memory and never stored from here: the CLI that pushed it has already stored it,
+/// and a store from this process would write its whole in-memory config over anything that
+/// changed on disk since it started. After a restart the stored value is read as usual.
+static PUSHED_SWITCH: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(SWITCH_UNSET);
+const SWITCH_UNSET: u8 = 0;
+const SWITCH_OFF: u8 = 1;
+const SWITCH_ON: u8 = 2;
+
+pub(crate) fn push_switch(value: &str) {
+    let v = if value == "Y" { SWITCH_ON } else { SWITCH_OFF };
+    PUSHED_SWITCH.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn pushed_switch() -> Option<bool> {
+    match PUSHED_SWITCH.load(std::sync::atomic::Ordering::Relaxed) {
+        SWITCH_ON => Some(true),
+        SWITCH_OFF => Some(false),
+        _ => None,
+    }
+}
+
+/// What the service reads back for the echo: the pushed value, else the stored one.
+pub(crate) fn switch_value() -> String {
+    match pushed_switch() {
+        Some(true) => "Y".to_owned(),
+        Some(false) => "N".to_owned(),
+        None => Config::get_option(OPTION_ALLOW_HEADLESS_DISPLAY),
+    }
+}
+
+/// The switch this process acts on: what was pushed to it, else what is stored.
+fn switch_on() -> bool {
+    switch_on_with(pushed_switch(), is_enabled())
+}
+
+fn switch_on_with(pushed: Option<bool>, stored: bool) -> bool {
+    pushed.unwrap_or(stored)
+}
+
+/// Tests that push the switch, or read a wrapper that depends on it, take this: the static is
+/// process-wide and tests run in parallel.
+#[cfg(test)]
+pub(crate) fn switch_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static SWITCH_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    SWITCH_TESTS.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+pub(crate) fn reset_pushed_switch() {
+    PUSHED_SWITCH.store(SWITCH_UNSET, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// A stored switch that changed under the pushed one takes over: the push was the CLI's word
+/// about the value on disk, and a synced config or an options map has since brought another.
+/// Called with the value read before that config was applied.
+pub(crate) fn note_stored_switch(before: &str) {
+    if Config::get_option(OPTION_ALLOW_HEADLESS_DISPLAY) != before {
+        reset_pushed_switch();
+    }
+}
+
 const DRM_CLASS: &str = "/sys/class/drm";
 const EDID_PARAM: &str = "/sys/module/drm/parameters/edid_firmware";
 const EDID_DIR: &str = "/lib/firmware/edid";
@@ -249,6 +310,58 @@ pub fn is_supported() -> bool {
 
 fn is_enabled() -> bool {
     Config::get_bool_option(OPTION_ALLOW_HEADLESS_DISPLAY)
+}
+
+/// Whether the capture side settles a topology change instead of demoting DRM at once: the
+/// operator turned the feature on, or a connector of ours is held. The second arm is for a
+/// capture process whose config predates the switch (a `--server` reads its config when it
+/// starts): after a force the EDID in sysfs says ours, and the transitions the watcher makes
+/// from then on settle as they do for a process that saw the switch.
+fn transition_may_settle_on(enabled: bool, all: &[Connector]) -> bool {
+    enabled || all.iter().any(|c| c.ours)
+}
+
+pub(crate) fn transition_may_settle() -> bool {
+    transition_may_settle_on(switch_on(), &connectors())
+}
+
+/// Why a cold, empty DRM probe is expected to fill soon: nothing real is attached, and a scanout
+/// of ours is already held or one is forceable exactly the way `enable()` would force it. The
+/// capture process evaluates this from sysfs and its own config; the watcher's settle window lives
+/// in the root service and cannot be read from here.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ScanoutExpectation {
+    pub enabled: bool,
+    pub no_real_output: bool,
+    pub ours: bool,
+    pub forceable: bool,
+}
+
+impl ScanoutExpectation {
+    pub fn expected(&self) -> bool {
+        self.no_real_output && (self.ours || (self.enabled && self.forceable))
+    }
+}
+
+fn scanout_expectation_on(enabled: bool, all: &[Connector], edid_param: &str) -> ScanoutExpectation {
+    // The same two refusals `enable()` makes: an unidentifiable connector is never forced, and a
+    // connector another entry already governs is never given our EDID.
+    let forceable = pick_connector(all).is_some_and(|t| {
+        marker_of(t).is_some()
+            && !edid_entries(edid_param)
+                .iter()
+                .any(|e| foreign_entry_covers(e, &t.name))
+    });
+    ScanoutExpectation {
+        enabled,
+        no_real_output: no_real_output(all),
+        ours: all.iter().any(|c| c.ours),
+        forceable,
+    }
+}
+
+pub(crate) fn scanout_expectation() -> ScanoutExpectation {
+    scanout_expectation_on(switch_on(), &connectors(), &read_edid_param())
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -734,7 +847,7 @@ fn force_on(state: &mut State, held: &Held) -> ResultType<()> {
         uninstall_edid();
         return Err(e);
     }
-    state.forced = vec![held.clone()];
+    record_fresh_force(state, held);
     let settled = wait_for(sysfs, true);
     log::info!(
         "headless display: forced {sysfs} on with a 1920x1080 edid{}",
@@ -756,6 +869,16 @@ fn force_on(state: &mut State, held: &Held) -> ResultType<()> {
         );
     }
     Ok(())
+}
+
+/// A fresh force starts the probe interval: the connector was just brought up, and re-probing it on
+/// the next poll would write `detect`, dropping the force it just got, and re-force it after the
+/// probe's 1.5 s wait. A hold adopted after a restart keeps `last_probe == None`
+/// (`State::default()`) on purpose: the physical state may have moved while the service was
+/// down, so probing it at once is right.
+fn record_fresh_force(state: &mut State, held: &Held) {
+    state.forced = vec![held.clone()];
+    state.last_probe = Some(Instant::now());
 }
 
 /// Force a connector on so this machine has a scanout. Returns the connector forced.
@@ -822,10 +945,7 @@ fn disable(state: &mut State) -> ResultType<()> {
     // actually names: both the card minor and the connector name get recycled, so the device and
     // the KMS object id are what keep it from landing on somebody else's connector.
     for (name, marker) in connectors_named_by_our_entries() {
-        for c in all
-            .iter()
-            .filter(|c| c.name == name && marker.claims(c.device.as_deref(), c.id.as_deref()))
-        {
+        for c in marker_targets(&name, &marker, &all) {
             add_target(&mut targets, c);
         }
     }
@@ -887,6 +1007,34 @@ struct Target {
     sysfs: String,
     name: String,
     marker: Option<Marker>,
+}
+
+/// The connectors one of our `edid_firmware` entries may be acted on through. An instance marker
+/// names exactly the connector it claims. A legacy marker carries no identity, so on a name that two
+/// cards expose it would claim both, and writing `detect` to a twin that a monitor is plugged into
+/// takes that output down: on twins it touches only a connector that reads our EDID, and a lone
+/// connector of that name as before.
+fn marker_targets<'a>(name: &str, marker: &Marker, all: &'a [Connector]) -> Vec<&'a Connector> {
+    let same: Vec<&Connector> = all.iter().filter(|c| c.name == name).collect();
+    match marker {
+        Marker::Legacy if same.len() != 1 => same.into_iter().filter(|c| c.ours).collect(),
+        _ => same
+            .into_iter()
+            .filter(|c| marker.claims(c.device.as_deref(), c.id.as_deref()))
+            .collect(),
+    }
+}
+
+/// The connectors a re-probe after a dropped hold may write `detect` to: the one carrying the
+/// name, or on twins only those that read our EDID. A rebound connector serves our blob, so the
+/// rule reaches it; a twin that is somebody's monitor is left alone.
+fn reprobe_targets<'a>(name: &str, all: &'a [Connector]) -> Vec<&'a Connector> {
+    let same: Vec<&Connector> = all.iter().filter(|c| c.name == name).collect();
+    if same.len() == 1 {
+        same
+    } else {
+        same.into_iter().filter(|c| c.ours).collect()
+    }
 }
 
 /// The connector a remembered hold may still be released through, or `None` when the hold is stale.
@@ -1053,7 +1201,7 @@ fn probe_held_connectors(state: &mut State) {
 /// Returns whether anything changed, so the caller can re-read a topology this just moved.
 fn reconcile_markers(all: &[Connector]) -> bool {
     let mut drop_names: Vec<String> = Vec::new();
-    let mut reprobe: Vec<String> = Vec::new();
+    let mut reprobe: Vec<(String, Marker)> = Vec::new();
     let mut upgrade: Vec<(String, Marker)> = Vec::new();
     for (name, marker) in connectors_named_by_our_entries() {
         match marker_action(&name, &marker, all) {
@@ -1062,7 +1210,7 @@ fn reconcile_markers(all: &[Connector]) -> bool {
             MarkerAction::Drop { reprobe: probe } => {
                 log::info!("headless display: dropping the hold on {name} ({marker:?})");
                 if probe {
-                    reprobe.push(name.clone());
+                    reprobe.push((name.clone(), marker.clone()));
                 }
                 drop_names.push(name);
             }
@@ -1081,12 +1229,18 @@ fn reconcile_markers(all: &[Connector]) -> bool {
             log::info!("headless display: the hold on {name} now records which connector it is");
         }
     }
-    for c in all
-        .iter()
-        .filter(|c| reprobe.iter().any(|name| *name == c.name))
-    {
-        if let Err(e) = write_status(&c.sysfs, "detect") {
-            log::warn!("headless display: cannot re-probe {}: {e}", c.sysfs);
+    for (name, marker) in &reprobe {
+        // An instance marker whose connector is gone re-probes whatever now holds the name (see
+        // above); a legacy one has no instance to have lost. Either way, on twins only the one
+        // that reads our EDID is written to: the other is somebody's monitor.
+        let targets: Vec<&Connector> = match marker {
+            Marker::Legacy => marker_targets(name, marker, all),
+            Marker::Instance { .. } => reprobe_targets(name, all),
+        };
+        for c in targets {
+            if let Err(e) = write_status(&c.sysfs, "detect") {
+                log::warn!("headless display: cannot re-probe {}: {e}", c.sysfs);
+            }
         }
     }
     true
@@ -1139,7 +1293,7 @@ fn marker_action(name: &str, marker: &Marker, all: &[Connector]) -> MarkerAction
 }
 
 fn tick(state: &mut State) {
-    if !is_enabled() {
+    if !switch_on() {
         // Turned off, or never on. Give back anything we are still holding, then stay out of sysfs.
         if holding_something(state) {
             let _ = disable(state);
@@ -1583,11 +1737,63 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_scanout_is_expected_only_where_the_watcher_would_give_one() {
+        let free = [c("card0-HDMI-A-1", "HDMI-A-1", false, false)];
+        assert!(scanout_expectation_on(true, &free, "").expected());
+        assert!(!scanout_expectation_on(false, &free, "").expected(), "switch off");
+        let ours = [c("card0-HDMI-A-1", "HDMI-A-1", true, true)];
+        assert!(scanout_expectation_on(false, &ours, "").expected(), "held: the switch is not needed");
+        assert!(!scanout_expectation_on(true, &macbook_pro_2018(), "").expected(), "a real output");
+        assert!(!scanout_expectation_on(true, &[], "").expected());
+        let edp = [c("card0-eDP-1", "eDP-1", false, false)];
+        assert!(!scanout_expectation_on(true, &edp, "").expected(), "nothing forceable");
+        let unidentified = [Connector {
+            device: None,
+            id: None,
+            ..c("card0-HDMI-A-1", "HDMI-A-1", false, false)
+        }];
+        assert!(!scanout_expectation_on(true, &unidentified, "").expected());
+        assert!(!scanout_expectation_on(true, &free, "HDMI-A-1:edid/operator.bin").expected());
+        assert!(!scanout_expectation_on(true, &free, "HDMI:edid/operator.bin").expected(), "a prefix");
+    }
+
+    /// A `--server` whose config predates the switch still settles once a connector of ours is
+    /// up: the EDID in sysfs says so. A real output alone, with the switch off, does not.
+    #[test]
+    fn a_held_connector_opens_the_gate_for_a_process_whose_config_predates_the_switch() {
+        let held = [c("card0-HDMI-A-1", "HDMI-A-1", true, true)];
+        assert!(transition_may_settle_on(false, &held), "held: the switch is not needed");
+        let with_real = [
+            c("card0-DP-1", "DP-1", true, false),
+            c("card0-HDMI-A-1", "HDMI-A-1", true, true),
+        ];
+        assert!(transition_may_settle_on(false, &with_real));
+        assert!(!scanout_expectation_on(true, &with_real, "").expected(), "not a cold start");
+        assert!(!transition_may_settle_on(false, &[c("card0-DP-1", "DP-1", true, false)]));
+        assert!(transition_may_settle_on(true, &[c("card0-DP-1", "DP-1", true, false)]));
+    }
+
     fn unrenderable(sysfs: &str, name: &str, connected: bool) -> Connector {
         Connector {
             drivable: false,
             ..c(sysfs, name, connected, false)
         }
+    }
+
+    #[test]
+    fn a_fresh_force_waits_out_the_probe_interval_and_an_adopted_one_does_not() {
+        let mut s = State::default();
+        record_fresh_force(&mut s, &held("card0-HDMI-A-1", "HDMI-A-1"));
+        assert_eq!(s.forced, vec![held("card0-HDMI-A-1", "HDMI-A-1")]);
+        assert!(
+            !real_display_probe_due(s.last_probe, false),
+            "a connector forced just now is not due a probe on the next poll"
+        );
+        assert!(
+            real_display_probe_due(State::default().last_probe, false),
+            "a hold adopted after a restart is probed at once"
+        );
     }
 
     #[test]
@@ -1706,6 +1912,43 @@ mod tests {
         ]
     }
 
+    #[test]
+    fn a_legacy_marker_touches_only_a_connector_it_names_or_that_carries_our_edid() {
+        let names = |v: Vec<&Connector>| v.iter().map(|c| c.sysfs.clone()).collect::<Vec<_>>();
+        let twins = [
+            c("card0-DP-1", "DP-1", true, false),
+            c("card1-DP-1", "DP-1", true, false),
+        ];
+        assert!(marker_targets("DP-1", &Marker::Legacy, &twins).is_empty());
+        let one_ours = [
+            c("card0-DP-1", "DP-1", true, false),
+            c("card1-DP-1", "DP-1", true, true),
+        ];
+        assert_eq!(names(marker_targets("DP-1", &Marker::Legacy, &one_ours)), ["card1-DP-1"]);
+        let lone = [c("card0-DP-1", "DP-1", true, false)];
+        assert_eq!(names(marker_targets("DP-1", &Marker::Legacy, &lone)), ["card0-DP-1"]);
+        let instance = Marker::Instance {
+            device: "card1".to_owned(),
+            id: "card1-DP-1".to_owned(),
+        };
+        assert_eq!(names(marker_targets("DP-1", &instance, &twins)), ["card1-DP-1"]);
+    }
+
+    /// Review of 24-sep: the re-probe after a dropped instance marker used to write `detect` to
+    /// every connector carrying the name, a twin with a real monitor included.
+    #[test]
+    fn an_instance_drop_reprobes_only_a_twin_that_reads_our_edid() {
+        let twins = [
+            c("card0-DP-1", "DP-1", true, false),
+            c("card1-DP-1", "DP-1", true, true),
+        ];
+        let names: Vec<&str> = reprobe_targets("DP-1", &twins).iter().map(|c| c.sysfs.as_str()).collect();
+        assert_eq!(names, ["card1-DP-1"]);
+        let lone = [c("card0-DP-1", "DP-1", true, false)];
+        assert_eq!(reprobe_targets("DP-1", &lone).len(), 1, "a lone connector is always reached");
+        assert!(reprobe_targets("DP-2", &twins).is_empty());
+    }
+
     // fufesou's P3: `disable()` used to pass only the remembered path to `add_target()`, so a
     // replacement connector occupying that path was released through the stale hold - a `detect`
     // that clears a force somebody else owns. The hold now has to claim the live identity.
@@ -1749,6 +1992,46 @@ mod tests {
             ..held("card0-HDMI-A-1", "HDMI-A-1")
         };
         assert!(hold_target(&legacy, &same).is_some());
+    }
+
+    /// rustdesk#15908 review (zhou, 23-sep), finding 2, the service side: a pushed option is
+    /// what this process acts on and echoes, and it is never stored from here.
+    #[test]
+    fn a_pushed_switch_is_acted_on_in_memory_and_never_stored() {
+        let _serial = switch_test_lock();
+        assert!(switch_on_with(None, true));
+        assert!(!switch_on_with(None, false));
+        assert!(switch_on_with(Some(true), false), "pushed on wins over stored off");
+        assert!(!switch_on_with(Some(false), true), "pushed off wins over stored on");
+        let stored = Config::get_option(OPTION_ALLOW_HEADLESS_DISPLAY);
+        push_switch("Y");
+        assert_eq!(pushed_switch(), Some(true));
+        assert_eq!(switch_value(), "Y");
+        push_switch("N");
+        assert_eq!(pushed_switch(), Some(false));
+        assert_eq!(switch_value(), "N");
+        assert_eq!(
+            Config::get_option(OPTION_ALLOW_HEADLESS_DISPLAY),
+            stored,
+            "a pushed switch never reaches the config"
+        );
+        reset_pushed_switch();
+        assert_eq!(pushed_switch(), None);
+        assert_eq!(switch_value(), stored, "unset: the echo reads the stored value");
+    }
+
+    /// A synced config or options map that changes the stored switch retires the pushed one;
+    /// one that leaves it as it was does not.
+    #[test]
+    fn a_stored_switch_that_changed_retires_the_pushed_one() {
+        let _serial = switch_test_lock();
+        let stored = Config::get_option(OPTION_ALLOW_HEADLESS_DISPLAY);
+        push_switch("Y");
+        note_stored_switch(&stored);
+        assert_eq!(pushed_switch(), Some(true), "unchanged on disk: the push stands");
+        note_stored_switch("not-what-is-stored");
+        assert_eq!(pushed_switch(), None, "changed on disk: the stored value takes over");
+        reset_pushed_switch();
     }
 
     // fufesou's P3: the kernel matches an `edid_firmware` entry by the prefix before the colon, so
