@@ -35,6 +35,67 @@ use std::{
 /// registered anywhere for that to hold.
 pub const OPTION_ALLOW_HEADLESS_DISPLAY: &str = "allow-headless-display";
 
+/// The switch as the service last received it over `_service`, or unset. A pushed option is
+/// applied in memory and never stored from here: the CLI that pushed it has already stored it,
+/// and a store from this process would write its whole in-memory config over anything that
+/// changed on disk since it started. After a restart the stored value is read as usual.
+static PUSHED_SWITCH: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(SWITCH_UNSET);
+const SWITCH_UNSET: u8 = 0;
+const SWITCH_OFF: u8 = 1;
+const SWITCH_ON: u8 = 2;
+
+pub(crate) fn push_switch(value: &str) {
+    let v = if value == "Y" { SWITCH_ON } else { SWITCH_OFF };
+    PUSHED_SWITCH.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn pushed_switch() -> Option<bool> {
+    match PUSHED_SWITCH.load(std::sync::atomic::Ordering::Relaxed) {
+        SWITCH_ON => Some(true),
+        SWITCH_OFF => Some(false),
+        _ => None,
+    }
+}
+
+/// What the service reads back for the echo: the pushed value, else the stored one.
+pub(crate) fn switch_value() -> String {
+    match pushed_switch() {
+        Some(true) => "Y".to_owned(),
+        Some(false) => "N".to_owned(),
+        None => Config::get_option(OPTION_ALLOW_HEADLESS_DISPLAY),
+    }
+}
+
+/// The switch this process acts on: what was pushed to it, else what is stored.
+fn switch_on() -> bool {
+    switch_on_with(pushed_switch(), is_enabled())
+}
+
+fn switch_on_with(pushed: Option<bool>, stored: bool) -> bool {
+    pushed.unwrap_or(stored)
+}
+
+/// Tests that push the switch, or read a wrapper that depends on it, take this: the static is
+/// process-wide and tests run in parallel.
+#[cfg(test)]
+pub(crate) fn switch_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static SWITCH_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    SWITCH_TESTS.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+pub(crate) fn reset_pushed_switch() {
+    PUSHED_SWITCH.store(SWITCH_UNSET, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// A stored switch that changed under the pushed one takes over: the push was the CLI's word
+/// about the value on disk, and a synced config or an options map has since brought another.
+/// Called with the value read before that config was applied.
+pub(crate) fn note_stored_switch(before: &str) {
+    if Config::get_option(OPTION_ALLOW_HEADLESS_DISPLAY) != before {
+        reset_pushed_switch();
+    }
+}
+
 const DRM_CLASS: &str = "/sys/class/drm";
 const EDID_PARAM: &str = "/sys/module/drm/parameters/edid_firmware";
 const EDID_DIR: &str = "/lib/firmware/edid";
@@ -1149,7 +1210,7 @@ fn marker_action(name: &str, marker: &Marker, all: &[Connector]) -> MarkerAction
 }
 
 fn tick(state: &mut State) {
-    if !is_enabled() {
+    if !switch_on() {
         // Turned off, or never on. Give back anything we are still holding, then stay out of sysfs.
         if holding_something(state) {
             let _ = disable(state);
@@ -1774,6 +1835,46 @@ mod tests {
             ..held("card0-HDMI-A-1", "HDMI-A-1")
         };
         assert!(hold_target(&legacy, &same).is_some());
+    }
+
+    /// rustdesk#15908 review (zhou, 23-sep), finding 2, the service side: a pushed option is
+    /// what this process acts on and echoes, and it is never stored from here.
+    #[test]
+    fn a_pushed_switch_is_acted_on_in_memory_and_never_stored() {
+        let _serial = switch_test_lock();
+        assert!(switch_on_with(None, true));
+        assert!(!switch_on_with(None, false));
+        assert!(switch_on_with(Some(true), false), "pushed on wins over stored off");
+        assert!(!switch_on_with(Some(false), true), "pushed off wins over stored on");
+        let stored = Config::get_option(OPTION_ALLOW_HEADLESS_DISPLAY);
+        push_switch("Y");
+        assert_eq!(pushed_switch(), Some(true));
+        assert_eq!(switch_value(), "Y");
+        push_switch("N");
+        assert_eq!(pushed_switch(), Some(false));
+        assert_eq!(switch_value(), "N");
+        assert_eq!(
+            Config::get_option(OPTION_ALLOW_HEADLESS_DISPLAY),
+            stored,
+            "a pushed switch never reaches the config"
+        );
+        reset_pushed_switch();
+        assert_eq!(pushed_switch(), None);
+        assert_eq!(switch_value(), stored, "unset: the echo reads the stored value");
+    }
+
+    /// A synced config or options map that changes the stored switch retires the pushed one;
+    /// one that leaves it as it was does not.
+    #[test]
+    fn a_stored_switch_that_changed_retires_the_pushed_one() {
+        let _serial = switch_test_lock();
+        let stored = Config::get_option(OPTION_ALLOW_HEADLESS_DISPLAY);
+        push_switch("Y");
+        note_stored_switch(&stored);
+        assert_eq!(pushed_switch(), Some(true), "unchanged on disk: the push stands");
+        note_stored_switch("not-what-is-stored");
+        assert_eq!(pushed_switch(), None, "changed on disk: the stored value takes over");
+        reset_pushed_switch();
     }
 
     // fufesou's P3: the kernel matches an `edid_firmware` entry by the prefix before the colon, so

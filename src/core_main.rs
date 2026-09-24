@@ -582,10 +582,9 @@ pub fn core_main() -> Option<Vec<String>> {
                             // display has no seat0 session, so there is no `--server` to talk to:
                             // the call quietly falls back to rewriting this process's config file,
                             // while the running root service keeps the config it read at startup
-                            // and never notices. So hand it to the service directly, over the one
-                            // channel that exists for exactly this and accepts exactly this
-                            // message.
-                            match crate::ipc::sync_config_to_service() {
+                            // and never notices. So hand this one option to the service directly,
+                            // over the protected channel, which admits exactly this key.
+                            match crate::ipc::set_service_option(KEY, want) {
                                 Ok(()) => println!("Done!"),
                                 Err(err) => println!(
                                     "Saved, but the running service did not pick it up ({err}); \
