@@ -734,7 +734,7 @@ fn force_on(state: &mut State, held: &Held) -> ResultType<()> {
         uninstall_edid();
         return Err(e);
     }
-    state.forced = vec![held.clone()];
+    record_fresh_force(state, held);
     let settled = wait_for(sysfs, true);
     log::info!(
         "headless display: forced {sysfs} on with a 1920x1080 edid{}",
@@ -756,6 +756,16 @@ fn force_on(state: &mut State, held: &Held) -> ResultType<()> {
         );
     }
     Ok(())
+}
+
+/// A fresh force starts the probe interval: the connector was just brought up, and re-probing it on
+/// the next poll would write `detect`, dropping the force it just got, and re-force it after the
+/// probe's 1.5 s wait. A hold adopted after a restart keeps `last_probe == None`
+/// (`State::default()`) on purpose: the physical state may have moved while the service was
+/// down, so probing it at once is right.
+fn record_fresh_force(state: &mut State, held: &Held) {
+    state.forced = vec![held.clone()];
+    state.last_probe = Some(Instant::now());
 }
 
 /// Force a connector on so this machine has a scanout. Returns the connector forced.
@@ -1588,6 +1598,21 @@ mod tests {
             drivable: false,
             ..c(sysfs, name, connected, false)
         }
+    }
+
+    #[test]
+    fn a_fresh_force_waits_out_the_probe_interval_and_an_adopted_one_does_not() {
+        let mut s = State::default();
+        record_fresh_force(&mut s, &held("card0-HDMI-A-1", "HDMI-A-1"));
+        assert_eq!(s.forced, vec![held("card0-HDMI-A-1", "HDMI-A-1")]);
+        assert!(
+            !real_display_probe_due(s.last_probe, false),
+            "a connector forced just now is not due a probe on the next poll"
+        );
+        assert!(
+            real_display_probe_due(State::default().last_probe, false),
+            "a hold adopted after a restart is probed at once"
+        );
     }
 
     #[test]
