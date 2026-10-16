@@ -1885,6 +1885,55 @@ pub(crate) fn is_available() -> bool {
     availability() == Availability::Available
 }
 
+/// How long a capture build waits for a headless output, see `wait_for_headless_output`. The
+/// watcher forces one about 6 s after the last display goes away (its stability wait plus a poll),
+/// and the compositor still has to put a mode on it.
+#[cfg(feature = "headless-display")]
+const HEADLESS_OUTPUT_WAIT: Duration = Duration::from_secs(12);
+
+/// With the headless display on, a machine whose last display just went away is given a forced
+/// one a few seconds later. A Wayland video service that starts while DRM is not available, on a
+/// machine with no display of its own, waits for it here instead of handing the session to a
+/// portal nobody can answer. Otherwise it returns at once. Blocking, and safe inside a runtime: the
+/// query runs on its own thread.
+#[cfg(feature = "headless-display")]
+pub(super) fn wait_for_headless_output() {
+    use crate::virtual_display_manager::linux as headless;
+    if !headless::is_enabled()
+        || crate::platform::linux::is_x11_for_drm()
+        || headless::has_real_output()
+        || is_available_cached()
+    {
+        return;
+    }
+    let deadline = Instant::now() + HEADLESS_OUTPUT_WAIT;
+    loop {
+        let sampled_gen = DRM_STATE_GEN.load(Ordering::Acquire);
+        if let Ok(list) = query_displays(false) {
+            if !list.is_empty() {
+                let mut st = DRM_STATE.lock().unwrap();
+                // As `refresh_unavailable_async`: a state published while this query ran is newer.
+                if DRM_STATE_GEN.load(Ordering::Acquire) == sampled_gen {
+                    log::info!("drm: headless output up ({} displays)", list.len());
+                    DRM_PROBE_FAILURES.store(0, Ordering::Relaxed);
+                    publish_probe_state(&mut st, ProbeState::Available(Instant::now(), list));
+                    drop(st);
+                    scrap::wayland::display::clear_wayland_displays_cache();
+                    return;
+                }
+                if matches!(&*st, ProbeState::Available(..)) {
+                    return;
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    log::info!("drm: no headless output within {HEADLESS_OUTPUT_WAIT:?}");
+}
+
 /// The negative mirror of `refresh_available_async`: re-verify a stale Unavailable without ever
 /// answering Unknown in the meantime. A failed or empty re-probe re-confirms the "no" with a
 /// fresh timestamp; only a non-empty display list flips the verdict.

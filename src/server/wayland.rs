@@ -388,6 +388,8 @@ pub(super) async fn ensure_inited() -> ResultType<()> {
     // DRM/KMS capture (opt-in): the root service owns the reader and the capturer self-inits over
     // IPC, so there is no PipeWire recorder to initialize here. But we still must set the uinput
     // desktop rect (check_init does this on the PipeWire path, and the DRM path skips check_init).
+    #[cfg(feature = "headless-display")]
+    super::drm_capturer::wait_for_headless_output();
     #[cfg(feature = "drm")]
     if super::drm_capturer::is_available_cached() {
         update_uinput_resolution().await;

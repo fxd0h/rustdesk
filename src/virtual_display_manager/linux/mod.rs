@@ -244,6 +244,12 @@ fn is_real_output(c: &Connector) -> bool {
     c.connected && !c.ours && c.drivable && !c.name.starts_with("Writeback")
 }
 
+/// Whether a display somebody plugged in is connected: what the capture side asks before it waits
+/// for a forced output. Every file it reads is world readable.
+pub fn has_real_output() -> bool {
+    connectors().iter().any(is_real_output)
+}
+
 pub fn is_supported() -> bool {
     Path::new(DRM_CLASS).exists() && !connectors().is_empty()
 }
@@ -251,7 +257,7 @@ pub fn is_supported() -> bool {
 /// `allow-` and not `enable-` is load-bearing. `option2bool` reads an `enable-` key as `value != "N"`
 /// - an absent value would default this ON - and an `allow-` key as `value == "Y"`, which is off
 /// until somebody says otherwise.
-fn is_enabled() -> bool {
+pub fn is_enabled() -> bool {
     Config::get_bool_option(OPTION_ALLOW_HEADLESS_DISPLAY)
 }
 
