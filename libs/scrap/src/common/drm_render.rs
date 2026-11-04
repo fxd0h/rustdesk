@@ -25,6 +25,11 @@ pub struct RenderConverter {
 impl RenderConverter {
     /// `node` is the render node of the GPU that exports the scanout; `None`/invalid path falls back to libdrmtap auto-selection.
     pub fn open_render(node: Option<&str>) -> Option<RenderConverter> {
+        // Skip the GPU->RAM readback of frames that did not change (libdrmtap reads this when it sets up
+        // its EGL state, which happens after this call). On by default here; an explicit value wins.
+        if std::env::var_os("DRMTAP_SKIP_UNCHANGED").is_none() {
+            std::env::set_var("DRMTAP_SKIP_UNCHANGED", "1");
+        }
         let lib = drmtap_dl::get()?;
         let open_render = lib.open_render;
         let node_cstr = match node.filter(|n| !n.is_empty()) {
